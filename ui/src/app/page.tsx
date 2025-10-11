@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Bell, LayoutDashboard } from "lucide-react";
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip, AreaChart, Area, BarChart, Bar } from "recharts";
 import { useQuery } from "@tanstack/react-query";
-import { fetchDemoCandles } from "@/lib/data";
+import { fetchKalshiCandles } from "@/lib/kalshi";
 /**
  * Minimal, clean dashboard with mock data + simple visuals.
  * - Overview: KPIs + tiny chart
@@ -36,8 +36,8 @@ export default function DashboardMocked() {
 
   const kpis = useMemo(() => computeKPIs(series, trades, alerts), [series, trades, alerts]);
   const { data: candles = [] } = useQuery({
-    queryKey: ["candles", "demo"],
-    queryFn: fetchDemoCandles,
+    queryKey: ["candles", "FED_RATE_DEC"],
+    queryFn: () => fetchKalshiCandles("FED_RATE_DEC"),
     refetchInterval: 5000,
   })
 
