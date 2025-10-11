@@ -6,7 +6,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Bell, LayoutDashboard } from "lucide-react";
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip, AreaChart, Area, BarChart, Bar } from "recharts";
-
+import { useQuery } from "@tanstack/react-query";
+import { fetchDemoCandles } from "@/lib/data";
 /**
  * Minimal, clean dashboard with mock data + simple visuals.
  * - Overview: KPIs + tiny chart
@@ -15,9 +16,13 @@ import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tool
  */
 export default function DashboardMocked() {
   const [series, setSeries] = useState(makeSeedSeries());
-  const [alerts, setAlerts] = useState(makeSeedAlerts());
-  const [trades, setTrades] = useState(makeSeedTrades());
+  const [alerts, setAlerts] = useState<any[]>([]);
+  const [trades, setTrades] = useState<any[]>([]);
 
+  useEffect(() => {
+    setAlerts(makeSeedAlerts());
+    setTrades(makeSeedTrades());
+  }, []);
   // lightweight ticker to keep things moving
   useEffect(() => {
     const id = setInterval(() => {
@@ -30,7 +35,13 @@ export default function DashboardMocked() {
   }, []);
 
   const kpis = useMemo(() => computeKPIs(series, trades, alerts), [series, trades, alerts]);
+  const { data: candles = [] } = useQuery({
+    queryKey: ["candles", "demo"],
+    queryFn: fetchDemoCandles,
+    refetchInterval: 5000,
+  })
 
+  console.log("candles length", candles.length, candles[0]);
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
@@ -85,7 +96,7 @@ export default function DashboardMocked() {
               </div>
               <div className="h-36">
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={series} margin={{ left: 8, right: 8, top: 8, bottom: 0 }}>
+                  <AreaChart data={candles} margin={{ left: 8, right: 8, top: 8, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis dataKey="t" tickFormatter={fmtTimeMini} minTickGap={30} />
                     <YAxis domain={[0, 100]} />
@@ -103,7 +114,7 @@ export default function DashboardMocked() {
               <h3 className="font-medium">Market Detail</h3>
               <div className="h-48">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={series} margin={{ left: 8, right: 8, top: 8, bottom: 0 }}>
+                  <LineChart data={candles} margin={{ left: 8, right: 8, top: 8, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis dataKey="t" tickFormatter={fmtTimeMini} minTickGap={30} />
                     <YAxis domain={[0, 100]} />
