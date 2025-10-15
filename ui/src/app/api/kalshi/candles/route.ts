@@ -1,45 +1,45 @@
-import { NextResponse } from "next/server";
+// lib/kalshi-events.ts
+export type MarketLite = {
+  ticker: string;
+  title: string;
+  open_interest: number;
+  liquidity: number;
+};
 
-// Kalshi public market-data endpoint (no auth required for this data)
-const BASE = "https://api.elections.kalshi.com/trade-api/v2";
+export async function fetchAllEventMarketsLite(): Promise<MarketLite[]> {
+  const BASE = "https://api.elections.kalshi.com/trade-api/v2/events";
+  let cursor = "";
+  const out: MarketLite[] = [];
 
-export async function GET(req: Request) {
-  const url = new URL(req.url);
-  const ticker = url.searchParams.get("ticker") || "FED_RATE_DEC";
-  // 2 hours of 1-min candles (adjust as you like)
-  const end = Math.floor(Date.now() / 1000);
-  const start = end - 2 * 60 * 60;
+  do {
+    const url = cursor
+      ? `${BASE}?limit=200&with_nested_markets=true&cursor=${encodeURIComponent(cursor)}`
+      : `${BASE}?limit=200&with_nested_markets=true`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    const data: { cursor?: string; events: any[] } = await res.json();
 
-  const qs = new URLSearchParams({
-    period_interval: "1",        // 1m candles (also supports 60 or 1440)
-    start_ts: String(start),
-    end_ts: String(end),
-  });
+    for (const ev of data.events || []) {
+      for (const m of ev.markets || []) {
+        out.push({
+          ticker: m.ticker,
+          title: m.title,
+          open_interest: Number(m.open_interest ?? 0),
+          liquidity: Number(m.liquidity ?? 0),
+        });
+      }
+    }
+    cursor = data.cursor || "";
+  } while (cursor);
 
-  const res = await fetch(`${BASE}/markets/${encodeURIComponent(ticker)}/candlesticks?${qs.toString()}`, {
-    // don't cache while developing
-    cache: "no-store",
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    return NextResponse.json({ error: text || "Kalshi error" }, { status: 502 });
-  }
-
-  type KalshiCandle = {
-    start_ts: number; end_ts: number;
-    open_price: number; high_price: number; low_price: number; close_price: number;
-    volume: number;
-  };
-
-  const data = (await res.json()) as { candlesticks: KalshiCandle[] };
-
-  // Map to your UI shape: { t, price, vol } — using close as the display price
-  const candles = (data.candlesticks || []).map(c => ({
-    t: new Date(c.end_ts * 1000).toISOString(),
-    price: c.close_price,     // 0–100 scale on Kalshi
-    vol: c.volume ?? 0,
-  }));
-
-  return NextResponse.json({ ticker, candles });
+  return out;
 }
+
+// convenience: sort by money already in the pool (open interest)
+export function sortByOpenInterest(desc: boolean = true) {
+  return (a: MarketLite, b: MarketLite) =>
+    desc ? b.open_interest - a.open_interest : a.open_interest - b.open_interest;
+}
+
+const markets = await fetchAllEventMarketsLite();
+const byPool = markets.sort(sortByOpenInterest(true)); // biggest “money in pool” first

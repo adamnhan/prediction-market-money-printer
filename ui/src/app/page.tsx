@@ -1,5 +1,5 @@
 "use client";
-
+import Link from "next/link";
 import React, { useEffect, useMemo, useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -48,6 +48,8 @@ export default function DashboardMocked() {
       <header className="sticky top-0 z-20 bg-white border-b">
         <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-3 flex items-center gap-3">
           <LayoutDashboard className="h-5 w-5" />
+          <Link href="/events" className="text-sm underline text-gray-700">Events</Link>
+
           <h1 className="text-lg font-semibold">InsiderWatch · Kalshi</h1>
           <div className="ml-auto">
             <Button variant="outline" size="sm" className="gap-1"><Bell className="h-4 w-4"/> Alerts</Button>
