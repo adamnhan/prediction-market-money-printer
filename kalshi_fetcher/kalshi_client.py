@@ -21,3 +21,16 @@ def request(endpoint: str, params: dict | None = None) -> dict:
     response.raise_for_status()  # throw if HTTP error
 
     return response.json()
+
+def get_markets():
+    """
+    Fetch all markets from the Kalshi API and return them.
+    """
+    data = request("/markets")
+    markets = data.get("markets", [])
+    print(f"Fetched {len(markets)} markets.")
+    return markets
+
+
+if __name__ == "__main__":
+    get_markets()
