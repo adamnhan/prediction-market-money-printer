@@ -148,7 +148,7 @@ if __name__ == "__main__":
     #   - fetch & save trades for up to 3 tickers
     fetch_all_closed_markets_trades(
         closed_markets_csv="../data/closed_markets.csv",
-        max_markets=3,
+        max_markets=200,
     )
 
 

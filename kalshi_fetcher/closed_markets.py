@@ -119,7 +119,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Fetch closed/settled markets from Kalshi")
-    parser.add_argument("--limit", type=int, default=100, help="Number of markets to fetch (default 100)")
+    parser.add_argument("--limit", type=int, default=200, help="Number of markets to fetch (default 100)")
     args = parser.parse_args()
 
     markets = fetch_closed_markets(limit=args.limit)

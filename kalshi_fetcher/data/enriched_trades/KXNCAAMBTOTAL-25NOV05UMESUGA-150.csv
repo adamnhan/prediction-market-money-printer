@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV05UMESUGA-150,2025-11-06T01:16:51.917553Z,0.01,200,no,3767cea7-0788-498e-19d8-b9dda9be63ae,KXNCAAMBTOTAL-25NOV05UMESUGA,Sports,2025-11-06T02:35:38.710501Z,2025-11-06 01:16:51.917553+00:00,2025-11-06 02:35:38.710501+00:00,4726.792948,78.77988246666668

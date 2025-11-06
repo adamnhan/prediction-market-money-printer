@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV05RIDRUTG-161,2025-11-05T23:49:40.776027Z,0.01,200,no,52ed1eb9-c9cf-6dbb-7b3c-15f0f27fb386,KXNCAAMBTOTAL-25NOV05RIDRUTG,Sports,2025-11-06T02:50:34.542542Z,2025-11-05 23:49:40.776027+00:00,2025-11-06 02:50:34.542542+00:00,10853.766515,180.89610858333333

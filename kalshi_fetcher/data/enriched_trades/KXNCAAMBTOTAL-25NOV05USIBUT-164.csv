@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV05USIBUT-164,2025-11-06T01:53:10.765567Z,0.01,200,no,6f897558-6213-527d-f016-12686f1ced62,KXNCAAMBTOTAL-25NOV05USIBUT,Sports,2025-11-06T02:35:38.151358Z,2025-11-06 01:53:10.765567+00:00,2025-11-06 02:35:38.151358+00:00,2547.385791,42.45642985

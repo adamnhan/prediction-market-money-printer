@@ -22,6 +22,15 @@ def request(endpoint: str, params: dict | None = None) -> dict:
 
     return response.json()
 
+def get_event_metadata(event_ticker: str) -> dict:
+    """
+    Fetch metadata for a single event from /events/{event_ticker}.
+    Returns the 'event' object from the API response.
+    """
+    data = request(f"/events/{event_ticker}")
+    # API shape is usually { "event": { ... } }
+    return data.get("event", {})
+
 def get_markets():
     """
     Fetch all markets from the Kalshi API and return them.
