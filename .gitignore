@@ -28,3 +28,8 @@ env/
 
 # Mypy
 .mypy_cache/
+
+#ignore data
+/data/
+/backend/kalshi_fetcher/data/
+
