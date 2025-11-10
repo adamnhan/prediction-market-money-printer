@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV08MONMLAS-161,2025-11-08T22:14:23.559466Z,0.01,200,no,4180a2a3-5fa7-78aa-c0c0-b8a4e81e0c69,KXNCAAMBTOTAL-25NOV08MONMLAS,Sports,2025-11-08T23:20:31.663074Z,2025-11-08 22:14:23.559466+00:00,2025-11-08 23:20:31.663074+00:00,3968.103608,66.13506013333333

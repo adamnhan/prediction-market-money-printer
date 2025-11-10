@@ -1,2 +1,0 @@
-ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
-KXNCAAMBTOTAL-25NOV05COPPLAS-151,2025-11-06T00:02:05.271007Z,0.01,200,no,797480bc-1e26-6a50-b154-f1fe32f79c3f,KXNCAAMBTOTAL-25NOV05COPPLAS,Sports,2025-11-06T02:16:02.207271Z,2025-11-06 00:02:05.271007+00:00,2025-11-06 02:16:02.207271+00:00,8036.936264,133.94893773333334

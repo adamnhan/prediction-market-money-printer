@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV08ARPBLMU-142,2025-11-09T03:45:04.959526Z,0.99,200,yes,f9a2233e-85c8-6b47-0b4f-fb6e811f37da,KXNCAAMBTOTAL-25NOV08ARPBLMU,Sports,2025-11-09T04:49:33.981012Z,2025-11-09 03:45:04.959526+00:00,2025-11-09 04:49:33.981012+00:00,3869.021486,64.48369143333333

@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV08LBSUFRES-154,2025-11-08T23:42:14.502419Z,0.01,200,no,cce4e58b-98fd-64d6-a371-b5ca576f92b5,KXNCAAMBTOTAL-25NOV08LBSUFRES,Sports,2025-11-09T00:44:59.899261Z,2025-11-08 23:42:14.502419+00:00,2025-11-09 00:44:59.899261+00:00,3765.396842,62.756614033333335

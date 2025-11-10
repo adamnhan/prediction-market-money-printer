@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXXRPD-25NOV0810-T2.2599,2025-11-08T14:25:29.884534Z,0.91,300,no,57e08329-89d7-4081-5f3f-73487cc5e8ce,KXXRPD-25NOV0810,Crypto,2025-11-08T15:00:00Z,2025-11-08 14:25:29.884534+00:00,2025-11-08 15:00:00+00:00,2070.115466,34.501924433333336

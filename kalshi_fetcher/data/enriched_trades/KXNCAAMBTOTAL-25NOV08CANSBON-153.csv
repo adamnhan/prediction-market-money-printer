@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV08CANSBON-153,2025-11-08T22:46:45.584371Z,0.99,200,yes,ceaf8b03-1c75-6fae-c393-ad8cd3425eb8,KXNCAAMBTOTAL-25NOV08CANSBON,Sports,2025-11-08T23:40:23.043079Z,2025-11-08 22:46:45.584371+00:00,2025-11-08 23:40:23.043079+00:00,3217.458708,53.6243118

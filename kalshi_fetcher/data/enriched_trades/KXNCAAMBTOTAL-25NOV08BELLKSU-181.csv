@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV08BELLKSU-181,2025-11-09T03:08:05.940297Z,0.01,199,no,6e0d2680-54cf-4a07-20cc-e894442d9831,KXNCAAMBTOTAL-25NOV08BELLKSU,Sports,2025-11-09T03:29:40.939315Z,2025-11-09 03:08:05.940297+00:00,2025-11-09 03:29:40.939315+00:00,1294.999018,21.583316966666665

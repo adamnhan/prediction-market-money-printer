@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV08PVWICH-149,2025-11-09T01:49:35.563042Z,0.99,200,yes,2521594c-f347-633e-e4d0-4409e0cc498d,KXNCAAMBTOTAL-25NOV08PVWICH,Sports,2025-11-09T02:29:48.573824Z,2025-11-09 01:49:35.563042+00:00,2025-11-09 02:29:48.573824+00:00,2413.010782,40.216846366666665

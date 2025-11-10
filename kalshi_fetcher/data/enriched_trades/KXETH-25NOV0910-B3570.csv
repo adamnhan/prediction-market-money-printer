@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXETH-25NOV0910-B3570,2025-11-09T14:32:41.929427Z,0.18,200,no,0340c95a-ed94-701f-5657-601a720f33fe,KXETH-25NOV0910,Crypto,2025-11-09T15:00:00Z,2025-11-09 14:32:41.929427+00:00,2025-11-09 15:00:00+00:00,1638.070573,27.301176216666665

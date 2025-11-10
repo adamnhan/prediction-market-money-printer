@@ -1,0 +1,3 @@
+ticker,created_time,price,count,taker_side,trade_id
+KXDOGE-25NOV0822-B0.172,2025-11-09T02:56:25.735969Z,0.77,6,yes,1f2a8a50-b608-7dfb-ca36-ff9dfb45ddab
+KXDOGE-25NOV0822-B0.172,2025-11-09T02:16:46.041361Z,0.7,300,no,13b2426f-1149-6740-4c4a-eb23114a7bde

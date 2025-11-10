@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXBTC-25NOV0910-B104125,2025-11-09T14:25:55.231019Z,0.03,200,no,ddab4c94-1b8a-6592-0e71-e7bde37044df,KXBTC-25NOV0910,Crypto,2025-11-09T15:00:00Z,2025-11-09 14:25:55.231019+00:00,2025-11-09 15:00:00+00:00,2044.768981,34.079483016666664

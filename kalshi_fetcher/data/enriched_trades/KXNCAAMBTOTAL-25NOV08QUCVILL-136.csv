@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV08QUCVILL-136,2025-11-09T01:22:38.569159Z,0.99,200,yes,c3c4a09f-6482-4ab6-cd4d-937d8085dc3a,KXNCAAMBTOTAL-25NOV08QUCVILL,Sports,2025-11-09T02:24:48.682023Z,2025-11-09 01:22:38.569159+00:00,2025-11-09 02:24:48.682023+00:00,3730.112864,62.168547733333334

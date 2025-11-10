@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXDOGED-25NOV0817-T0.1849999,2025-11-08T07:59:52.942489Z,0.26,287,yes,51680ecb-d623-697c-2e79-afb8224b1acf,KXDOGED-25NOV0817,Crypto,2025-11-08T22:00:00Z,2025-11-08 07:59:52.942489+00:00,2025-11-08 22:00:00+00:00,50407.057511,840.1176251833333

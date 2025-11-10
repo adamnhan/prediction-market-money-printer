@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV08EWUCOLO-147,2025-11-08T22:47:35.019308Z,0.99,200,yes,1b71ad97-7882-708a-23ae-1a8a283f120a,KXNCAAMBTOTAL-25NOV08EWUCOLO,Sports,2025-11-09T00:25:08.234447Z,2025-11-08 22:47:35.019308+00:00,2025-11-09 00:25:08.234447+00:00,5853.215139,97.55358565

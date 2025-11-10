@@ -1,0 +1,2 @@
+ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
+KXNCAAMBTOTAL-25NOV08FIUNEB-147,2025-11-08T19:35:44.663106Z,0.99,200,yes,8cefbff0-edba-5efe-60f5-6f66a7a9455a,KXNCAAMBTOTAL-25NOV08FIUNEB,Sports,2025-11-08T20:10:36.099798Z,2025-11-08 19:35:44.663106+00:00,2025-11-08 20:10:36.099798+00:00,2091.436692,34.8572782

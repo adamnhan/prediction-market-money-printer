@@ -1,0 +1,3 @@
+ticker,created_time,price,count,taker_side,trade_id
+KXXRPD-25NOV0823-T2.2799,2025-11-09T03:06:52.151003Z,0.08,300,no,8ffbfe92-6594-4a0e-36f6-881cde3f05c7
+KXXRPD-25NOV0823-T2.2799,2025-11-09T03:06:52.125939Z,0.08,300,yes,e1cc8ac9-6e6f-4d6d-b34b-e2e6652b2ddc
