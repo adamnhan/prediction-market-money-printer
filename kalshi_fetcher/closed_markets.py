@@ -1,10 +1,13 @@
 # kalshi_fetcher/closed_markets.py
+#closemarkets,events_enrichment,markets_enrichment, fetch_trades, trades_enrichment
+
+# kalshi_fetcher/closed_markets.py
+# closemarkets,events_enrichment,markets_enrichment, fetch_trades, trades_enrichment
 
 from __future__ import annotations
 
 from pathlib import Path
 import csv
-import time
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +31,8 @@ def fetch_closed_markets(limit: int = 1000):
     Fetch up to `limit` markets from Kalshi that are closed/settled/determined.
 
     Uses pagination with `cursor` and respects the API's max page size of 1000.
+
+    This is the original "global limit" fetch – kept for backwards compatibility.
     """
     print(f"[closed_markets] Fetching up to {limit} markets from /markets...")
 
@@ -66,6 +71,137 @@ def fetch_closed_markets(limit: int = 1000):
 
     return markets
 
+
+def fetch_closed_markets_by_category(
+    categories: List[str],
+    per_category_limit: int,
+    result_filter: str = "both",
+    global_limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Stream through /markets using pagination and collect ONLY markets whose
+    event category is in `categories`, until each category reaches
+    `per_category_limit` (or we run out of markets / hit global_limit).
+
+    This avoids fetching a giant pool and then sampling; instead we stop
+    as soon as capacities are filled.
+
+    result_filter:
+      - 'both' : no result filter
+      - 'yes'  : only result == 'yes'
+      - 'no'   : only result == 'no'
+
+    global_limit:
+      - If not None, acts as a safety cap on how many markets we scan in total.
+    """
+    target_set = {c.strip() for c in categories if c.strip()}
+    print(f"[closed_markets] Streaming fetch for categories: {sorted(target_set)}")
+    print(f"[closed_markets] Per-category capacity: {per_category_limit}")
+
+    collected: List[Dict[str, Any]] = []
+    cat_counts: Counter[str] = Counter()
+    event_meta_cache: Dict[str, Dict[str, Any]] = {}
+
+    cursor: Optional[str] = None
+    total_seen = 0
+    remaining_global = global_limit if global_limit is not None else float("inf")
+
+    while remaining_global > 0:
+        page_limit = min(1000, int(remaining_global))
+
+        params = {
+            "limit": page_limit,
+            "status": "closed,settled",
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        data = request("/markets", params=params)
+        batch = data.get("markets", [])
+        if not batch:
+            print("[closed_markets] No more markets returned from API.")
+            break
+
+        total_seen += len(batch)
+        remaining_global -= len(batch)
+        print(f"[closed_markets] Scanned {total_seen} markets so far "
+              f"(this page: {len(batch)})")
+
+        # Normalize status and filter to closed/settled
+        normalized_batch: List[Dict[str, Any]] = []
+        for m in batch:
+            raw_status = m.get("status")
+            label = STATUS_MAP.get(raw_status)
+            if label is None:
+                continue
+            m2 = dict(m)
+            m2["normalized_status"] = label
+            normalized_batch.append(m2)
+
+        # Apply result filter + category filter + capacity
+        for m in normalized_batch:
+            if result_filter != "both":
+                allowed = result_filter.lower()
+                res = (m.get("result") or "").lower()
+                if res != allowed:
+                    continue
+
+            et = m.get("event_ticker")
+            if not et:
+                continue
+
+            if not m.get("volume") or m["volume"] == 0:
+                continue
+
+            # Fetch metadata lazily per event_ticker
+            if et not in event_meta_cache:
+                try:
+                    meta = get_event_metadata(et)
+                except Exception as e:
+                    print(f"[warn] Failed to fetch metadata for {et}: {e}")
+                    meta = {}
+                event_meta_cache[et] = meta
+
+            meta = event_meta_cache.get(et, {})
+            cat = meta.get("category") or "Unknown"
+
+            if cat not in target_set:
+                continue
+
+            # Check per-category capacity
+            if cat_counts[cat] >= per_category_limit:
+                continue
+
+            m3 = dict(m)
+            m3["category"] = cat
+            collected.append(m3)
+            cat_counts[cat] += 1
+
+        # Progress log
+        print("[closed_markets] Progress by category:")
+        for cat in sorted(target_set):
+            cur = cat_counts.get(cat, 0)
+            cap = per_category_limit
+            pct = (cur / cap * 100) if cap > 0 else 0
+            print(f"  - {cat}: {cur} / {cap} ({pct:.1f}%)")
+
+        # Check if all capacities are filled
+        if all(cat_counts.get(cat, 0) >= per_category_limit for cat in target_set):
+            print("[closed_markets] All requested category capacities filled; stopping early.")
+            break
+
+        cursor = data.get("cursor")
+        if not cursor:
+            print("[closed_markets] API cursor exhausted; no further pages.")
+            break
+
+    print(f"[closed_markets] Finished streaming fetch.")
+    print(f"[closed_markets] Total markets collected: {len(collected)}")
+    print("[closed_markets] Final category counts:")
+    for cat in sorted(target_set):
+        print(f"  {cat}: {cat_counts.get(cat, 0)}")
+
+    return collected
 
 
 def filter_closed_or_settled(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -156,6 +292,9 @@ def sample_by_category(
       - 'high'      : top-N by volume (descending)
       - 'low'       : bottom-N by volume (ascending)
       - 'balanced'  : 50/50 low-volume & high-volume per category
+
+    This is the original "sample after full fetch" behavior, used when we are
+    NOT in streaming category-cap mode.
     """
     # Normalize category names for matching
     if categories is not None:
@@ -271,20 +410,21 @@ def main():
         "--limit",
         type=int,
         default=2000,
-        help="Number of markets to fetch from API before filtering (default 2000)",
+        help="Safety cap: maximum number of markets to scan from API (default 2000)",
     )
     parser.add_argument(
         "--categories",
         default=None,
         help="Comma-separated list of categories to keep (e.g. 'Sports,Culture'). "
-             "Default: keep all categories.",
+             "If provided together with --per-category-limit, we will stream "
+             "until capacities are filled per category.",
     )
     parser.add_argument(
         "--per-category-limit",
         type=int,
         default=None,
-        help="Maximum number of markets to keep per category (after filtering). "
-             "Default: no per-category cap.",
+        help="Maximum number of markets to keep per category. "
+             "If used with --categories, we stream until capacities are filled.",
     )
     parser.add_argument(
         "--result",
@@ -296,39 +436,51 @@ def main():
         "--sample-mode",
         choices=["high", "low", "balanced"],
         default="balanced",
-        help="How to select within each category when per-category-limit is set. "
+        help="How to select within each category when per-category-limit is set "
+             "in non-streaming mode. Ignored in streaming category-cap mode. "
              "'high' = highest volume, 'low' = lowest volume, 'balanced' = 50/50 "
              "low & high volume (default).",
     )
 
     args = parser.parse_args()
 
-    markets = fetch_closed_markets(limit=args.limit)
-    closed_markets = filter_closed_or_settled(markets)
-    closed_markets = enrich_with_categories(closed_markets)
-    closed_markets = filter_by_result(closed_markets, args.result)
-
-    # After result filter
-    cat_counts = Counter(m.get("category") or "Unknown" for m in closed_markets)
-    print("[debug] Categories after filters (result + status):")
-    for cat, cnt in cat_counts.items():
-        print(f"  {cat}: {cnt}")
-
-
     if args.categories:
         category_list = [c.strip() for c in args.categories.split(",") if c.strip()]
     else:
         category_list = None
 
-    closed_markets = sample_by_category(
-        closed_markets,
-        categories=category_list,
-        per_category_limit=args.per_category_limit,
-        sample_mode=args.sample_mode,
-    )
+    # If we have both categories and per-category-limit, use the new streaming mode
+    if category_list and args.per_category_limit is not None:
+        print("[closed_markets] Using streaming category-cap fetch mode.")
+        closed_markets = fetch_closed_markets_by_category(
+            categories=category_list,
+            per_category_limit=args.per_category_limit,
+            result_filter=args.result,
+            global_limit=args.limit,
+        )
+    else:
+        print("[closed_markets] Using legacy global-limit fetch + sampling mode.")
+        markets = fetch_closed_markets(limit=args.limit)
+        closed_markets = filter_closed_or_settled(markets)
+        closed_markets = enrich_with_categories(closed_markets)
+        closed_markets = filter_by_result(closed_markets, args.result)
+
+        # After result filter
+        cat_counts = Counter(m.get("category") or "Unknown" for m in closed_markets)
+        print("[debug] Categories after filters (result + status):")
+        for cat, cnt in cat_counts.items():
+            print(f"  {cat}: {cnt}")
+
+        closed_markets = sample_by_category(
+            closed_markets,
+            categories=category_list,
+            per_category_limit=args.per_category_limit,
+            sample_mode=args.sample_mode,
+        )
 
     save_closed_markets_csv(closed_markets)
     print(f"[closed_markets] Done. Final markets count: {len(closed_markets)}")
+
 
 if __name__ == "__main__":
     main()

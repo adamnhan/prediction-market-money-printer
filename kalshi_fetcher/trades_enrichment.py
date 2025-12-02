@@ -44,7 +44,12 @@ def enrich_trades_file(trades_path: str, lookup_df: pd.DataFrame) -> pd.DataFram
     )
 
     # Parse timestamps as UTC datetimes
-    merged["created_time_dt"] = pd.to_datetime(merged["created_time"], utc=True)
+    merged["created_time_dt"] = pd.to_datetime(
+        merged["created_time"],
+        utc=True,
+        errors="coerce",          # optional but nice to avoid crashes on weird rows
+        # or: format="ISO8601" if your pandas version supports it
+    )
     merged["event_time_dt"] = pd.to_datetime(
         merged["event_time"], utc=True, errors="coerce"
     )
