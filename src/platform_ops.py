@@ -84,7 +84,9 @@ async def get_event(event_ticker: str, api_key: Optional[str] = None) -> Dict[st
 
 
 async def get_market(market_ticker: str, api_key: Optional[str] = None) -> Dict[str, Any]:
-    return await _request("GET", GET_MARKET(market_ticker), api_key=api_key)
+    url = GET_MARKET(market_ticker)
+    print(f"[platform_ops] DEBUG get_market URL={url}")   # <-- TEMP LOG
+    return await _request("GET", url, api_key=api_key)
 
 
 async def get_market_candles(market_ticker: str, start_ts: Optional[int] = None, end_ts: Optional[int] = None,
