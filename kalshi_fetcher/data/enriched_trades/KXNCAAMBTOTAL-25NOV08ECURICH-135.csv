@@ -1,2 +1,0 @@
-ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
-KXNCAAMBTOTAL-25NOV08ECURICH-135,2025-11-09T01:03:23.504234Z,0.99,200,yes,a81a06d0-a9e4-6db0-6ba3-c65fffc186f4,KXNCAAMBTOTAL-25NOV08ECURICH,Sports,2025-11-09T02:19:55.045289Z,2025-11-09 01:03:23.504234+00:00,2025-11-09 02:19:55.045289+00:00,4591.541055,76.52568425

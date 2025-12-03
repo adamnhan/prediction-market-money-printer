@@ -1,2 +1,0 @@
-ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
-KXNCAAMBTOTAL-25NOV08UTAUNM-156,2025-11-08T23:06:26.79351Z,0.01,200,no,336be87f-4502-65ec-a239-5cd3064b5b35,KXNCAAMBTOTAL-25NOV08UTAUNM,Sports,2025-11-08T23:50:22.299127Z,2025-11-08 23:06:26.793510+00:00,2025-11-08 23:50:22.299127+00:00,2635.505617,43.925093616666665

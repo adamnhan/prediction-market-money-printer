@@ -1,2 +1,0 @@
-ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
-KXNCAAMBTOTAL-25NOV08DREXJOES-136,2025-11-08T20:01:42.082389Z,0.99,200,yes,fe3a038b-ed38-6b00-45e9-e8fbe31c7b0f,KXNCAAMBTOTAL-25NOV08DREXJOES,Sports,2025-11-08T20:30:33.956944Z,2025-11-08 20:01:42.082389+00:00,2025-11-08 20:30:33.956944+00:00,1731.874555,28.86457591666667

@@ -1,2 +1,0 @@
-ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
-KXNCAAMBTOTAL-25NOV08LAFTEX-141,2025-11-08T21:43:23.466431Z,0.99,200,yes,c21ab85d-7560-6544-d354-0817f598b01f,KXNCAAMBTOTAL-25NOV08LAFTEX,Sports,2025-11-08T22:45:25.713105Z,2025-11-08 21:43:23.466431+00:00,2025-11-08 22:45:25.713105+00:00,3722.246674,62.037444566666665

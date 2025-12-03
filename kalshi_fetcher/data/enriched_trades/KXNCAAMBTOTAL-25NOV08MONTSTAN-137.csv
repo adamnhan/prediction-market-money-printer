@@ -1,2 +1,0 @@
-ticker,created_time,price,count,taker_side,trade_id,event_ticker,category,event_time,created_time_dt,event_time_dt,seconds_before_event,minutes_before_event
-KXNCAAMBTOTAL-25NOV08MONTSTAN-137,2025-11-08T22:44:11.49859Z,0.99,200,yes,4a7a248d-d612-6b55-855d-1f2c75f3cd4d,KXNCAAMBTOTAL-25NOV08MONTSTAN,Sports,2025-11-09T00:44:59.731167Z,2025-11-08 22:44:11.498590+00:00,2025-11-09 00:44:59.731167+00:00,7248.232577,120.80387628333332
