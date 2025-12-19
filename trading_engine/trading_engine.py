@@ -1,57 +1,35 @@
 from typing import Dict, List, Any, Optional, Literal
 from src.event_service import fetch_event_metadata
-from dataclasses import dataclass
-from src import platform_ops  
-from datetime import datetime
+from dataclasses import asdict
+from src import platform_ops
+from datetime import datetime, timezone
+from trading_engine.strategy_config import StrategyConfig
+from trading_engine.models import MarketEntry, Position, MarketUpdate  
+from trading_engine.strategy_helpers import (
+    can_open_new_position,
+    pnl_exit_reason,
+    time_exit_reason,
+    strategy_exit_reason,
+)
+from trading_engine.capital import CapitalState
+from trading_engine.market_utils import (
+    map_status_from_target,
+    extract_yes_price_from_target,
+)
 
-@dataclass
-class MarketEntry:
-    """
-    A single market we are tracking under an event.
-    """
-    event_ticker: str
-    market_ticker: str
 
-    # lifecycle/status (we'll populate later from real data)
-    status: str = "unknown"  # e.g. "not_open", "open", "closed"
 
-    # simple price placeholders (YES/NO last or mid prices)
-    last_price_yes: Optional[float] = None
-    last_price_no: Optional[float] = None
-
-@dataclass
-class Position:
-    # Core identity / linkages
-    id: int = -1
-    event_ticker: str = ""
-    market_ticker: str = ""
-    side: Literal["NO"] = "NO"
-
-    # Sizing & prices
-    qty: int = 0
-    entry_price: float = 0.0
-    current_price: float = 0.0  # mark price for NO
-
-    # Lifecycle
-    status: str = "open"  # "open" | "closed" | etc.
-    entry_ts: Optional[datetime] = None
-    exit_ts: Optional[datetime] = None
-
-    # PnL
-    realized_pnl: float = 0.0
-    unrealized_pnl: float = 0.0
 
 
 
 class TradingEngine:
-    def __init__(self):
+    def __init__(self, strategy_config: Optional[StrategyConfig] = None,):
         # Events + logs
         self._events: Dict[str, Dict[str, Any]] = {}
         self._logs: List[str] = []
 
         # Capital tracking (private but consistent)
-        self._total_capital = 10000.0
-        self._used_capital = 0.0
+        self.capital = CapitalState(total=10000.0)
 
         # Markets keyed by market_ticker
         self.markets: Dict[str, MarketEntry] = {}
@@ -59,8 +37,12 @@ class TradingEngine:
         # Position storage + ID generator
         self._next_position_id = 1
         self.positions: Dict[int, Position] = {}  # position_id -> Position
+        self.strategy_config: StrategyConfig = strategy_config or StrategyConfig()
 
-
+        # NEW: strategy-related counters (Phase 4 – not used yet)
+        self._auto_entries_count = 0
+        self._auto_exits_count = 0
+        self._skipped_entries_due_to_risk = 0
 
     # ---- Core actions ----
 
@@ -114,18 +96,15 @@ class TradingEngine:
             self.log(f"[EVENT] removed {ticker}")
 
     def set_total_capital(self, amount: float):
-        self._total_capital = float(amount)
-        self.log(f"Set total capital to {self._total_capital}")
+        self.capital.total = float(amount)
+        self.log(f"Set total capital to {self.capital.total}")
 
     # ---- Read-only views ----
 
     def get_state(self):
         """Return a snapshot of current engine state for the UI."""
-        open_positions = [p for p in self.positions.values() if p.status == "open"]
-        total_unrealized = sum(p.unrealized_pnl for p in open_positions)
-        capital_at_risk = sum(p.entry_price * p.qty for p in open_positions)
-        closed_positions = [p for p in self.positions.values() if p.status == "closed"]
-        total_realized = sum(p.realized_pnl for p in closed_positions)
+        positions_list = list(self.positions.values())
+        capital = self.capital.compute_totals(positions_list)
 
         return {
             "events": [
@@ -142,19 +121,15 @@ class TradingEngine:
             ],
             "logs": list(self._logs),
             "positions": self.get_positions(),
-            "capital": {
-                "total": self._total_capital,  # starting capital (fixed)
-                "used": self._used_capital,
-                # available cash = starting capital - used + realized PnL
-                "available": self._total_capital - self._used_capital + total_realized,
-                "capital_at_risk": capital_at_risk,
-                "unrealized_pnl": total_unrealized,
-                "realized_pnl": total_realized,
+            "capital": capital,
+            "strategy_config": asdict(self.strategy_config),
+            "strategy_counters": {
+                "auto_entries": self._auto_entries_count,
+                "auto_exits": self._auto_exits_count,
+                "skipped_entries_due_to_risk": self._skipped_entries_due_to_risk,
             },
-
             "markets": {mt: vars(m) for mt, m in self.markets.items()},
         }
-
 
     def add_market_for_event(self, event_ticker: str, market_ticker: str):
         """
@@ -227,58 +202,15 @@ class TradingEngine:
         )
 
         # --- Status mapping ---
-        raw_status = (
-            target.get("lifecycle_status")
-            or target.get("status")
-            or target.get("state")
-            or "unknown"
-        )
-
-        raw_status_norm = raw_status.lower() if isinstance(raw_status, str) else "unknown"
-
-        status = "unknown"
-        if raw_status_norm in ("open", "trading", "active", "initialized"):
-            status = "open"
-        elif raw_status_norm in ("pending", "upcoming"):
-            status = "not_open"
-        elif raw_status_norm in ("closed", "settled", "expired"):
-            status = "closed"
-
+        raw_status, status = map_status_from_target(target)
         market.status = status
 
         # --- Simple price extraction (best effort; tweak keys as needed) ---
-        data_price_yes = (
-            target.get("last_price_yes")
-            or target.get("last_price")
-            or target.get("yes_last_price")
-        )
-        best_bid_yes = target.get("yes_bid") or target.get("best_bid_yes")
-        best_ask_yes = target.get("yes_ask") or target.get("best_ask_yes")
-
-        price_yes = None
-
-        if best_bid_yes is not None and best_ask_yes is not None:
-            try:
-                price_yes = (float(best_bid_yes) + float(best_ask_yes)) / 2.0
-            except (TypeError, ValueError):
-                price_yes = None
-
-        if price_yes is None and data_price_yes is not None:
-            try:
-                price_yes = float(data_price_yes)
-            except (TypeError, ValueError):
-                price_yes = None
-
-        # 🔧 Normalize from cents to 0–1 if needed
-        if price_yes is not None and price_yes > 1.0:
-            price_yes = price_yes / 100.0
-
-        # Optional: clamp into [0,1] just to be safe
-        if price_yes is not None:
-            price_yes = max(0.0, min(1.0, price_yes))
+        price_yes = extract_yes_price_from_target(target)
 
         market.last_price_yes = price_yes
         market.last_price_no = 1.0 - price_yes if price_yes is not None else None
+
 
         self.log(
             f"[MARKET] Updated metadata for {market_ticker}: "
@@ -290,14 +222,101 @@ class TradingEngine:
         if status == "closed":
             self._auto_close_positions_for_market(market_ticker)
 
+        # NEW: if the market is open, let the strategy try an auto NO entry
+        if status == "open":
+            self.auto_open_no_for_market(market_ticker)
+
         # --- Update positions for this market (mark-to-market for NO) ---
+
         if market.last_price_no is not None:
-            for pos in self.positions.values():
+            # Use list(...) in case positions change while iterating
+            for pos in list(self.positions.values()):
                 if pos.market_ticker == market_ticker and pos.status == "open":
                     pos.current_price = market.last_price_no
                     # Simple PnL: profit if current NO price < entry NO price
-                    pos.unrealized_pnl = (pos.entry_price - pos.current_price) * pos.qty
+                    pos.unrealized_pnl = (pos.current_price - pos.entry_price) * pos.qty
 
+                    # Unified strategy-driven exit check (PnL + time)
+                    exit_reason = strategy_exit_reason(pos, self.strategy_config)
+
+                    # Only act if we still have an open position and a reason
+                    if exit_reason is not None and pos.status == "open":
+                        # PnL-based reasons come back as "pnl_take_profit" / "pnl_stop_loss"
+                        if exit_reason.startswith("pnl_"):
+                            pnl_reason = exit_reason.replace("pnl_", "")
+
+                            # Keep existing PnL log style
+                            self.log(
+                                f"PNL_EXIT_SIGNAL: pos_id={pos.id} "
+                                f"market={market_ticker} reason={pnl_reason} "
+                                f"unrealized={pos.unrealized_pnl}"
+                            )
+
+                            self._auto_exits_count += 1
+                            self.log(
+                                f"AUTO_EXIT_PNL: pos_id={pos.id} "
+                                f"market={market_ticker} reason={pnl_reason} "
+                                f"unrealized={pos.unrealized_pnl}"
+                            )
+                            self.close_position(pos.id, reason=exit_reason)
+
+                        # Time-based exits: "time_expired"
+                        elif exit_reason == "time_expired":
+                            age = (
+                                datetime.utcnow() - pos.entry_ts
+                            ).total_seconds() if pos.entry_ts else None
+
+                            self.log(
+                                f"TIME_EXIT_SIGNAL: pos_id={pos.id} "
+                                f"market={market_ticker} reason={exit_reason} "
+                                f"age={age}"
+                            )
+
+                            self._auto_exits_count += 1
+                            self.log(
+                                f"AUTO_EXIT_TIME: pos_id={pos.id} "
+                                f"market={market_ticker} reason={exit_reason} "
+                                f"age={age}"
+                            )
+                            self.close_position(pos.id, reason=exit_reason)
+
+
+    def auto_open_no_for_market(self, market_ticker: str) -> None:
+        """
+        Strategy-driven wrapper around maybe_open_no_position_for_market.
+
+        If this call results in one or more new open NO positions for the
+        given market, it increments the auto_entries counter and logs them.
+
+        Phase 4 note: this is not yet called from the update loop. It only
+        becomes active once wired into the automation flow.
+        """
+        market_ticker = market_ticker.upper()
+
+        # Snapshot open position IDs for this market before
+        before_ids = {
+            p.id
+            for p in self.positions.values()
+            if p.market_ticker == market_ticker and p.status == "open"
+        }
+
+        # Reuse existing logic (risk checks, market status, duplicates, etc.)
+        self.maybe_open_no_position_for_market(market_ticker)
+
+        # Snapshot after calling the manual entry function
+        after_ids = {
+            p.id
+            for p in self.positions.values()
+            if p.market_ticker == market_ticker and p.status == "open"
+        }
+
+        new_ids = after_ids - before_ids
+        if new_ids:
+            for pid in new_ids:
+                self._auto_entries_count += 1
+                self.log(
+                    f"AUTO_ENTRY_NO: pos_id={pid} market={market_ticker}"
+                )
 
     def maybe_open_no_position_for_market(self, market_ticker: str):
         """
@@ -322,7 +341,7 @@ class TradingEngine:
         # Avoid duplicate NO positions for the same market
         
         for pos in self.positions.values():
-            if pos.market_ticker == market_ticker and pos.side == "NO":
+            if pos.market_ticker == market_ticker and (pos.side or "").upper() == "NO" and (pos.status or "").lower() == "open":
                 self.log(
                     f"[TRADE] Already have a NO position in {market_ticker}; "
                     f"skipping new entry."
@@ -332,7 +351,51 @@ class TradingEngine:
 
         # For now: fixed position size + dummy price
         qty = 1
-        entry_price = market.last_price_no if market.last_price_no is not None else 0.5
+
+        # Require a sane NO price in dollars before entering.
+        entry_price = market.last_price_no
+        if entry_price is None:
+            self.log(f"[TRADE] No live NO price for {market_ticker}; skipping entry.")
+            return
+
+        entry_price = float(entry_price)
+
+        # Kalshi prices should be in (0, 1]. If outside, don't trade.
+        if entry_price <= 0.0 or entry_price > 1.0:
+            self.log(
+                f"[TRADE] Invalid NO price for entry: market={market_ticker} price_no={entry_price}; skipping entry."
+            )
+            return
+
+
+
+        # --- NEW: strategy risk checks (Phase 4: log-only, no enforcement yet) ---
+        if not can_open_new_position(
+            strategy_config=self.strategy_config,
+            positions=list(self.positions.values()),
+            market_ticker=market_ticker,
+            qty=qty,
+            entry_price=entry_price,
+            total_capital=self.capital.total,
+        ):
+
+            self._skipped_entries_due_to_risk += 1
+            self.log(
+                f"ENTRY_SKIPPED_RISK: market={market_ticker} qty={qty} price={entry_price}"
+            )
+            return 
+        
+                # Optional: only enter if NO price is cheap enough
+        cfg = self.strategy_config
+        if cfg.max_no_entry_price is not None and entry_price is not None:
+            if entry_price > cfg.max_no_entry_price:
+                self.log(
+                    f"ENTRY_SKIPPED_PRICE: market={market_ticker} "
+                    f"price_no={entry_price} max_no_entry_price={cfg.max_no_entry_price}"
+                )
+                self._skipped_entries_due_to_risk += 1
+                return
+
 
         self.open_paper_position(
             market_ticker=market_ticker,
@@ -391,13 +454,15 @@ class TradingEngine:
 
         self.positions[position.id] = position
 
+        self.capital.reserve(entry_price, qty)
+
         self.log(
             f"[TRADE] Opened PAPER {position.side} position: "
             f"market={market_ticker}, qty={qty}, entry={entry_price}, "
             f"pos_id={position.id}"
         )
 
-    def close_position(self, position_id: int):
+    def close_position(self, position_id: int, reason: Optional[str] = None):
         """
         Close an open paper position:
         - capture exit price (current mark)
@@ -406,6 +471,12 @@ class TradingEngine:
         - free capital (simple model)
         """
         pos = self.positions.get(position_id)
+
+        self.log(
+            f"[TRADE] close_position called for id={position_id}, "
+            f"found={pos is not None}, status={getattr(pos, 'status', None)}"
+        )
+
         if pos is None:
             self.log(f"[TRADE] Attempted close on unknown position id={position_id}")
             return
@@ -419,7 +490,7 @@ class TradingEngine:
 
         # Realized PnL for a NO position:
         # profit if price goes down
-        pos.realized_pnl = (pos.entry_price - exit_price) * pos.qty
+        pos.realized_pnl = (exit_price - pos.entry_price) * pos.qty
         pos.unrealized_pnl = 0.0  # no longer active
 
         # Mark lifecycle
@@ -427,13 +498,163 @@ class TradingEngine:
         pos.exit_ts = datetime.utcnow()
 
         # Free capital (simple model = entry_price * qty)
-        freed_capital = pos.entry_price * pos.qty
-        self._used_capital = max(0, self._used_capital - freed_capital)
+        self.capital.release(pos.entry_price, pos.qty)
 
         self.log(
             f"[TRADE] Closed position {position_id}: "
             f"exit_price={exit_price}, realized_pnl={pos.realized_pnl}"
         )
+
+    def on_market_update(self, update: MarketUpdate) -> None:
+        """
+        Receive a normalized live market update from WebSocket.
+
+        Responsibilities:
+        1) Log the update (compact)
+        2) Update MarketEntry.last_price_yes/last_price_no/last_update_ts
+        3) Mark-to-market open NO positions using last_price_no (update current_price + unrealized_pnl)
+        """
+
+        # --- 1) Log ---
+        if len(self._logs) > 5000:
+            self._logs = self._logs[-2500:]
+
+        # --- 2) Update internal market state ---
+        market_ticker = (update.market_ticker or "").upper()
+        if not market_ticker:
+            return
+
+        market = self.markets.get(market_ticker)
+
+        # WS may arrive before REST attach/load; create a stub entry if needed
+        if market is None:
+            market = MarketEntry(
+                event_ticker="unknown",  # backfill later when REST knows it
+                market_ticker=market_ticker,
+            )
+            self.markets[market_ticker] = market
+
+        # best_yes/best_no should be produced by ws_client book logic
+        # WS sends prices in cents (0-100). Store dollars everywhere.
+        if update.best_yes is not None:
+            market.last_price_yes = float(update.best_yes) / 100.0
+
+        if update.best_no is not None:
+            market.last_price_no = float(update.best_no) / 100.0
+
+
+        if update.ts is not None:
+            market.last_update_ts = update.ts
+
+        # --- 3) Mark-to-market open NO positions (your strategy) ---
+        # If we don't have a NO price, we can't MTM.
+        if market.last_price_no is None:
+            return
+
+        live_no = float(market.last_price_no)
+
+        for pos in self.positions.values():
+            pos_mt = (getattr(pos, "market_ticker", "") or "").upper()
+            if pos_mt != market_ticker:
+                continue
+
+            status = (getattr(pos, "status", "") or "").lower()
+            if status != "open":
+                continue
+
+            side = (getattr(pos, "side", "") or "").lower()
+            if side != "no":
+                continue
+
+            pos.current_price = live_no
+
+            qty = float(getattr(pos, "qty", 1) or 1)
+            entry = float(getattr(pos, "entry_price", 0) or 0)
+
+            # Unrealized PnL in price units
+            pos.unrealized_pnl = (entry - pos.current_price) * qty
+
+            
+            if len(self._logs) > 5000:
+                self._logs = self._logs[-2500:]
+            
+        # --- 4) WS-driven auto-exits (only for this market) ---
+        now = datetime.now(timezone.utc)
+
+        positions_to_close: list[tuple[int, str]] = []
+
+        for pos in self.positions.values():
+            pos_mt = (getattr(pos, "market_ticker", "") or "").upper()
+            if pos_mt != market_ticker:
+                continue
+
+            status = (getattr(pos, "status", "") or "").lower()
+            if status != "open":
+                continue
+
+            side = (getattr(pos, "side", "") or "").lower()
+            if side != "no":
+                continue
+
+            # Guard: don't evaluate exits until we have the basics
+            if getattr(pos, "entry_price", None) is None:
+                continue
+            if getattr(pos, "current_price", None) is None:
+                continue
+            entry_ts = getattr(pos, "entry_ts", None)
+            if entry_ts is None:
+                continue
+
+            # Guard: don't auto-exit in the same instant as entry (protect against bad timestamps)
+            try:
+                # entry_ts might be a datetime or a string in your model; handle datetime only here
+                if hasattr(entry_ts, "tzinfo"):
+                    # normalize naive -> UTC
+                    if entry_ts.tzinfo is None:
+                        entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                    if (now - entry_ts).total_seconds() < 2:
+                        continue
+            except Exception:
+                # if timestamp math fails, don't auto-exit
+                continue
+
+            # Call your existing exit logic
+            decision = None
+            try:
+                decision = strategy_exit_reason(pos, self.strategy_config, now)
+            except TypeError:
+                decision = strategy_exit_reason(pos, self.strategy_config)
+
+            # Normalize decision into (should_exit, reason)
+            should_exit = False
+            reason = None
+
+            if decision is None or decision is False:
+                should_exit = False
+            elif isinstance(decision, tuple) and len(decision) >= 1 and isinstance(decision[0], bool):
+                should_exit = decision[0]
+                reason = str(decision[1]) if len(decision) > 1 else "exit"
+            elif isinstance(decision, dict) and "exit" in decision:
+                should_exit = bool(decision.get("exit"))
+                reason = str(decision.get("reason") or decision.get("exit_reason") or "exit")
+            elif isinstance(decision, str):
+                # treat common "no exit" strings as no-exit
+                if decision.strip().lower() in ("", "none", "no_exit", "hold", "keep", "continue"):
+                    should_exit = False
+                else:
+                    should_exit = True
+                    reason = decision
+            else:
+                # last resort: don't accidentally close on truthy junk
+                should_exit = False
+
+            if should_exit:
+                positions_to_close.append((pos.id, reason or "exit"))
+
+        for position_id, reason in positions_to_close:
+            self._logs.append(f"[AUTO_EXIT_WS] pos={position_id} market={market_ticker} reason={reason}")
+            self.close_position(position_id)
+
 
 
     # ---- Helpers / stubs ----
@@ -455,7 +676,7 @@ class TradingEngine:
         self._next_position_id += 1
         return pid
     
-    def _auto_close_positions_for_market(self, market_ticker: str):
+    def _auto_close_positions_for_market(self, market_ticker: str) -> None:
         """
         Auto-close all open positions in a market when the market is closed/settled.
         Uses the latest NO price as the exit price if available.
@@ -467,9 +688,17 @@ class TradingEngine:
 
         exit_price = market.last_price_no
 
-        for pos in self.positions.values():
+        # Use items() so we have both pos_id and pos for logging/closing
+        for pos_id, pos in list(self.positions.items()):
             if pos.market_ticker == market_ticker and pos.status == "open":
                 # If we have a fresh NO price, use it as the mark before closing
                 if exit_price is not None:
                     pos.current_price = exit_price
-                self.close_position(pos.id)
+
+                # NEW: track and log auto exits
+                self._auto_exits_count += 1
+                self.log(
+                    f"AUTO_EXIT: pos_id={pos_id} market={market_ticker} reason=market_closed"
+                )
+
+                self.close_position(pos_id, reason="market_closed")

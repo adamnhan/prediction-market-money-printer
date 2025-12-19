@@ -13,7 +13,7 @@ type Props = {
 
 export function DebugPanel({ state, show, onToggle }: Props) {
   return (
-    <Card className="flex flex-col border-slate-800 bg-slate-900/70">
+    <Card className="flex h-80 flex-col overflow-hidden border-slate-800 bg-slate-900/70">
       <CardHeader className="flex flex-row items-center justify-between pb-2">
         <CardTitle className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-400">
           <Bug className="h-4 w-4" />
@@ -28,11 +28,12 @@ export function DebugPanel({ state, show, onToggle }: Props) {
           {show ? "Hide" : "Show"}
         </Button>
       </CardHeader>
-      <CardContent>
+
+      <CardContent className="flex-1">
         {show ? (
-          <div className="mt-1 rounded-lg border border-slate-800 bg-slate-950/80">
-            <ScrollArea className="max-h-64 p-3">
-              <pre className="text-xs text-slate-200">
+          <div className="mt-1 flex h-64 flex-col rounded-lg border border-slate-800 bg-slate-950/60">
+            <ScrollArea className="h-full p-3">
+              <pre className="text-xs font-mono text-slate-200 whitespace-pre">
                 {state ? JSON.stringify(state, null, 2) : "Loading..."}
               </pre>
             </ScrollArea>

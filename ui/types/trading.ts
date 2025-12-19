@@ -45,4 +45,5 @@ export type MarketEntry = {
   status: string;
   last_price_yes: number | null;
   last_price_no: number | null;
+  last_update_ts: string | null;
 };

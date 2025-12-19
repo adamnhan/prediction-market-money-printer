@@ -181,7 +181,7 @@ export default function HomePage() {
           />
 
           <MarketsPanel
-            markets={(state?.markets as any) ?? {}}
+            markets={state?.markets ?? {}}
             loading={!state}
           />
         </>

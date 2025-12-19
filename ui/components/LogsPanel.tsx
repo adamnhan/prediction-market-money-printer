@@ -9,7 +9,7 @@ type Props = {
 
 export function LogsPanel({ logs, loading }: Props) {
   return (
-    <Card className="flex flex-col border-slate-800 bg-slate-900/70">
+    <Card className="flex h-80 flex-col overflow-hidden border-slate-800 bg-slate-900/70">
       <CardHeader className="pb-2">
         <CardTitle className="text-sm font-semibold uppercase tracking-wide text-slate-400">
           Logs
@@ -21,8 +21,8 @@ export function LogsPanel({ logs, loading }: Props) {
         ) : logs.length === 0 ? (
           <p className="text-sm text-slate-500">No logs yet.</p>
         ) : (
-          <div className="mt-1 rounded-lg border border-slate-800 bg-slate-950/60">
-            <ScrollArea className="max-h-64 p-3 text-xs font-mono text-slate-200">
+          <div className="mt-1 flex h-64 flex-col rounded-lg border border-slate-800 bg-slate-950/60">
+            <ScrollArea className="h-full p-3 text-xs font-mono text-slate-200">
               <ul className="space-y-1">
                 {logs
                   .slice()

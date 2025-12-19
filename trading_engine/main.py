@@ -6,6 +6,9 @@ from .trading_engine import TradingEngine
 from pydantic import BaseModel
 import logging
 from src import platform_ops
+import asyncio
+from src.ws_client import connect_and_listen, request_subscribe
+
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -29,6 +32,13 @@ class AddEventRequest(BaseModel):
 class AddMarketRequest(BaseModel):
     event_ticker: str
     market_ticker: str
+
+
+@app.on_event("startup")
+async def _startup_ws():
+    # Start WS connection in the background (no subscriptions yet)
+    asyncio.create_task(connect_and_listen(engine))
+
 
 @app.get("/state")
 def get_state():
@@ -56,7 +66,12 @@ def remove_event(ticker: str):
 @app.post("/markets")
 async def add_market(req: AddMarketRequest):
     engine.add_market_for_event(req.event_ticker, req.market_ticker)
-    return {"status": "ok"}
+
+    # Start WS subscription immediately for this market
+    request_subscribe(req.market_ticker.upper())
+
+    return {"status": "ok", "subscribed": req.market_ticker.upper()}
+
 
 @app.get("/events/{event_ticker}/markets")
 async def list_event_markets(event_ticker: str):
