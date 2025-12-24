@@ -1,8 +1,8 @@
 from typing import Dict, List, Any, Optional, Literal
-from src.event_service import fetch_event_metadata
 from dataclasses import asdict
+from src.event_service import fetch_event_metadata
 from src import platform_ops
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from trading_engine.strategy_config import StrategyConfig
 from trading_engine.models import MarketEntry, Position, MarketUpdate  
 from trading_engine.strategy_helpers import (
@@ -11,7 +11,11 @@ from trading_engine.strategy_helpers import (
     time_exit_reason,
     strategy_exit_reason,
 )
+from src.ws_client import request_unsubscribe
 from trading_engine.capital import CapitalState
+from trading_engine import engine_state_store
+from trading_engine.trade_ledger import record_trade_close
+from trading_engine.trade_ledger import compute_circuit_breaker_stats
 from trading_engine.market_utils import (
     map_status_from_target,
     extract_yes_price_from_target,
@@ -28,11 +32,20 @@ class TradingEngine:
         self._events: Dict[str, Dict[str, Any]] = {}
         self._logs: List[str] = []
 
+        # Operator flags (to be persisted)
+        self.pause_entries: bool = False
+        self.pause_all: bool = False
+
         # Capital tracking (private but consistent)
         self.capital = CapitalState(total=10000.0)
 
+        # Circuit breaker state
+        self._cooldown_until: datetime | None = None
+
         # Markets keyed by market_ticker
         self.markets: Dict[str, MarketEntry] = {}
+        # Markets we already traded/closed and should not auto-reenter
+        self._retired_markets: set[str] = set()
 
         # Position storage + ID generator
         self._next_position_id = 1
@@ -95,6 +108,13 @@ class TradingEngine:
             self._events.pop(ticker)
             self.log(f"[EVENT] removed {ticker}")
 
+            # If removing the event detaches its markets, unsubscribe them
+            to_remove = [
+                mt for mt, m in list(self.markets.items()) if m.event_ticker == ticker
+            ]
+            for mt in to_remove:
+                self.remove_market(mt)
+
     def set_total_capital(self, amount: float):
         self.capital.total = float(amount)
         self.log(f"Set total capital to {self.capital.total}")
@@ -105,6 +125,8 @@ class TradingEngine:
         """Return a snapshot of current engine state for the UI."""
         positions_list = list(self.positions.values())
         capital = self.capital.compute_totals(positions_list)
+
+        cb_stats = self._circuit_breaker_stats()
 
         return {
             "events": [
@@ -123,10 +145,27 @@ class TradingEngine:
             "positions": self.get_positions(),
             "capital": capital,
             "strategy_config": asdict(self.strategy_config),
+            "operator_flags": {
+                "pause_entries": self.pause_entries,
+                "pause_all": self.pause_all,
+            },
+            "circuit_breakers": {
+                "cooldown_until": self._cooldown_until.isoformat() if self._cooldown_until else None,
+                "today_realized_pnl": cb_stats.get("today_realized_pnl"),
+                "today_trades": cb_stats.get("today_trades"),
+                "max_drawdown": cb_stats.get("max_drawdown"),
+                "limits": {
+                    "daily_loss_limit": self.strategy_config.daily_loss_limit,
+                    "max_drawdown": self.strategy_config.max_drawdown,
+                    "max_trades_per_day": self.strategy_config.max_trades_per_day,
+                    "cooldown_minutes_after_stop": self.strategy_config.cooldown_minutes_after_stop,
+                },
+            },
             "strategy_counters": {
                 "auto_entries": self._auto_entries_count,
                 "auto_exits": self._auto_exits_count,
                 "skipped_entries_due_to_risk": self._skipped_entries_due_to_risk,
+                "last_risk_skip_reason": getattr(self, "_last_risk_skip_reason", None),
             },
             "markets": {mt: vars(m) for mt, m in self.markets.items()},
         }
@@ -145,6 +184,33 @@ class TradingEngine:
 
         self.markets[market_ticker] = entry
         self.log(f"[MARKET] Added market {market_ticker} for event {event_ticker}")
+        # Optional: if previously retired, keep it retired to avoid re-entry
+        self._persist_control_state()
+
+    def remove_market(self, market_ticker: str) -> None:
+        market_ticker = market_ticker.upper()
+        if market_ticker not in self.markets:
+            return
+
+        # Mark as retired to block future auto-entries
+        self._retired_markets.add(market_ticker)
+
+        # Don't unsubscribe if we still have open positions in the market
+        has_open = any(
+            (p.market_ticker or "").upper() == market_ticker and (p.status or "").lower() == "open"
+            for p in self.positions.values()
+        )
+        if has_open:
+            self.log(
+                f"[MARKET] Skipping unsubscribe for {market_ticker}: open positions exist"
+            )
+            return
+
+        self.markets.pop(market_ticker, None)
+        self.log(f"[MARKET] Removed market {market_ticker}")
+        request_unsubscribe(market_ticker)
+        # Persist control state after market removal
+        self._persist_control_state()
 
     async def update_market_metadata(self, market_ticker: str):
         """
@@ -224,7 +290,7 @@ class TradingEngine:
 
         # NEW: if the market is open, let the strategy try an auto NO entry
         if status == "open":
-            self.auto_open_no_for_market(market_ticker)
+            self._maybe_trigger_auto_no_entry(market_ticker, source="REST")
 
         # --- Update positions for this market (mark-to-market for NO) ---
 
@@ -281,7 +347,7 @@ class TradingEngine:
                             self.close_position(pos.id, reason=exit_reason)
 
 
-    def auto_open_no_for_market(self, market_ticker: str) -> None:
+    def auto_open_no_for_market(self, market_ticker: str, source: str = "WS") -> None:
         """
         Strategy-driven wrapper around maybe_open_no_position_for_market.
 
@@ -315,7 +381,7 @@ class TradingEngine:
             for pid in new_ids:
                 self._auto_entries_count += 1
                 self.log(
-                    f"AUTO_ENTRY_NO: pos_id={pid} market={market_ticker}"
+                    f"AUTO_ENTRY_NO_{source}: pos_id={pid} market={market_ticker}"
                 )
 
     def maybe_open_no_position_for_market(self, market_ticker: str):
@@ -327,8 +393,26 @@ class TradingEngine:
         market_ticker = market_ticker.upper()
         market = self.markets.get(market_ticker)
 
+        # Global operator gates
+        if getattr(self, "pause_all", False):
+            self.log(f"[TRADE] Global pause_all active; skipping entry for {market_ticker}")
+            return
+        if getattr(self, "pause_entries", False):
+            self.log(f"[TRADE] Entries paused; skipping entry for {market_ticker}")
+            return
+
         if market is None:
             self.log(f"[TRADE] Cannot evaluate NO entry: unknown market {market_ticker}")
+            return
+
+        # Do not re-enter a market we've retired after closing
+        if market_ticker in getattr(self, "_retired_markets", set()):
+            self.log(f"[TRADE] Market {market_ticker} retired; skipping re-entry.")
+            return
+
+        # Do not re-enter a market once we've traded it and detached it
+        if market.status == "closed":
+            self.log(f"[TRADE] Market {market_ticker} marked closed; skipping re-entry.")
             return
 
         if market.status != "open":
@@ -370,20 +454,33 @@ class TradingEngine:
 
 
         # --- NEW: strategy risk checks (Phase 4: log-only, no enforcement yet) ---
-        if not can_open_new_position(
+        allowed, risk_reason = can_open_new_position(
             strategy_config=self.strategy_config,
             positions=list(self.positions.values()),
             market_ticker=market_ticker,
             qty=qty,
             entry_price=entry_price,
             total_capital=self.capital.total,
-        ):
+        )
+
+        if not allowed:
 
             self._skipped_entries_due_to_risk += 1
+            self._last_risk_skip_reason = risk_reason
             self.log(
-                f"ENTRY_SKIPPED_RISK: market={market_ticker} qty={qty} price={entry_price}"
+                f"ENTRY_SKIPPED_RISK: market={market_ticker} qty={qty} price={entry_price} reason={risk_reason}"
             )
             return 
+
+        # Circuit breakers: enforce operator safety limits
+        cb_allowed, cb_reason = self._circuit_breaker_allows_entry()
+        if not cb_allowed:
+            self._skipped_entries_due_to_risk += 1
+            self._last_risk_skip_reason = cb_reason
+            self.log(
+                f"ENTRY_SKIPPED_CIRCUIT: market={market_ticker} qty={qty} price={entry_price} reason={cb_reason}"
+            )
+            return
         
                 # Optional: only enter if NO price is cheap enough
         cfg = self.strategy_config
@@ -408,6 +505,35 @@ class TradingEngine:
             f"[TRADE] (simple rule) Opened paper NO position in {market_ticker} "
             f"with qty={qty}, entry_price={entry_price}"
         )
+
+    def _maybe_trigger_auto_no_entry(
+        self, market_ticker: str, source: str = "WS", prev_price_no: float | None = None
+    ) -> None:
+        """
+        Centralized hook for auto NO entries (WS or REST).
+        Ensures market is open, price is present, and optional price-change gating.
+        """
+        market_ticker = market_ticker.upper()
+        market = self.markets.get(market_ticker)
+        if market is None:
+            return
+
+        if market.status != "open":
+            return
+
+        if market.last_price_no is None:
+            return
+
+        if prev_price_no is not None and market.last_price_no == prev_price_no:
+            self.log(
+                f"[AUTO_ENTRY_SKIP_{source}] market={market_ticker} price_no={market.last_price_no} reason=same_price"
+            )
+            return
+
+        self.log(
+            f"[AUTO_ENTRY_CHECK_{source}] market={market_ticker} price_no={market.last_price_no}"
+        )
+        self.auto_open_no_for_market(market_ticker, source=source)
 
 
     def open_paper_position(
@@ -462,6 +588,9 @@ class TradingEngine:
             f"pos_id={position.id}"
         )
 
+        # Persist control/trading state best-effort for crash resilience
+        self._persist_control_state()
+
     def close_position(self, position_id: int, reason: Optional[str] = None):
         """
         Close an open paper position:
@@ -505,6 +634,31 @@ class TradingEngine:
             f"exit_price={exit_price}, realized_pnl={pos.realized_pnl}"
         )
 
+        # Persist closed trade to ledger; don't let ledger errors break trading flow.
+        try:
+            record_trade_close(
+                position=pos,
+                exit_reason=reason or "exit",
+                strategy_snapshot=asdict(self.strategy_config) if self.strategy_config else None,
+            )
+        except Exception as e:
+            self.log(f"[TRADE_LEDGER] failed to record trade {position_id}: {e}")
+
+        # If stop-loss triggered, start cooldown (if configured)
+        if reason and "stop_loss" in str(reason) and self.strategy_config.cooldown_minutes_after_stop:
+            try:
+                minutes = int(self.strategy_config.cooldown_minutes_after_stop)
+                self._cooldown_until = datetime.utcnow() + timedelta(minutes=minutes)
+                self.log(f"[COOLDOWN] stop_loss triggered; cooling until {self._cooldown_until.isoformat()}")
+            except Exception as e:
+                self.log(f"[COOLDOWN] failed to start cooldown: {e}")
+
+        # If this was the last open position in the market, detach/unsubscribe
+        self._detach_market_if_idle(pos.market_ticker)
+
+        # Persist control/trading state best-effort for crash resilience
+        self._persist_control_state()
+
     def on_market_update(self, update: MarketUpdate) -> None:
         """
         Receive a normalized live market update from WebSocket.
@@ -525,6 +679,7 @@ class TradingEngine:
             return
 
         market = self.markets.get(market_ticker)
+        prev_price_no = market.last_price_no if market is not None else None
 
         # WS may arrive before REST attach/load; create a stub entry if needed
         if market is None:
@@ -542,9 +697,20 @@ class TradingEngine:
         if update.best_no is not None:
             market.last_price_no = float(update.best_no) / 100.0
 
-
         if update.ts is not None:
             market.last_update_ts = update.ts
+
+        # If we see live prices but no status yet, assume open for WS-driven flow
+        if market.status not in ("open", "closed") and (
+            market.last_price_no is not None or market.last_price_yes is not None
+        ):
+            market.status = "open"
+            self.log(f"[MARKET_STATUS_WS] market={market_ticker} status=open (via live update)")
+
+        # Evaluate NO entries using live WS price when the market is open
+        self._maybe_trigger_auto_no_entry(
+            market_ticker, source="WS", prev_price_no=prev_price_no
+        )
 
         # --- 3) Mark-to-market open NO positions (your strategy) ---
         # If we don't have a NO price, we can't MTM.
@@ -582,6 +748,10 @@ class TradingEngine:
         now = datetime.now(timezone.utc)
 
         positions_to_close: list[tuple[int, str]] = []
+
+        if getattr(self, "pause_all", False):
+            self.log(f"[AUTO_EXIT_SKIP] pause_all active; skipping WS auto exits for {market_ticker}")
+            return
 
         for pos in self.positions.values():
             pos_mt = (getattr(pos, "market_ticker", "") or "").upper()
@@ -652,6 +822,7 @@ class TradingEngine:
                 positions_to_close.append((pos.id, reason or "exit"))
 
         for position_id, reason in positions_to_close:
+            self._auto_exits_count += 1
             self._logs.append(f"[AUTO_EXIT_WS] pos={position_id} market={market_ticker} reason={reason}")
             self.close_position(position_id)
 
@@ -675,6 +846,186 @@ class TradingEngine:
         pid = self._next_position_id
         self._next_position_id += 1
         return pid
+
+    def close_all_positions(self) -> int:
+        """
+        Close all open positions (paper). Returns count closed.
+        """
+        closed = 0
+        # Use list copy to avoid mutation during iteration.
+        for pos_id, pos in list(self.positions.items()):
+            if getattr(pos, "status", "").lower() == "open":
+                self.close_position(pos_id, reason="operator_close_all")
+                closed += 1
+        # Persist after bulk close
+        self._persist_control_state()
+        return closed
+
+    def set_operator_flags(
+        self, pause_entries: Optional[bool] = None, pause_all: Optional[bool] = None
+    ) -> dict[str, bool]:
+        """
+        Update operator pause flags and persist if anything changed.
+        """
+        changed = False
+        if pause_entries is not None and bool(pause_entries) != self.pause_entries:
+            self.pause_entries = bool(pause_entries)
+            changed = True
+        if pause_all is not None and bool(pause_all) != self.pause_all:
+            self.pause_all = bool(pause_all)
+            changed = True
+
+        if changed:
+            self.log(
+                f"[OPERATOR_FLAGS] pause_entries={self.pause_entries} pause_all={self.pause_all}"
+            )
+            self._persist_control_state()
+
+        return {"pause_entries": self.pause_entries, "pause_all": self.pause_all}
+
+    def _circuit_breaker_stats(self) -> Dict[str, Any]:
+        try:
+            return compute_circuit_breaker_stats()
+        except Exception as e:
+            self.log(f"[CIRCUIT_BREAKER] stats error: {e}")
+            return {"today_realized_pnl": 0.0, "today_trades": 0, "max_drawdown": 0.0}
+
+    # ---- Persistence helpers ----
+
+    def get_control_state_snapshot(self) -> Dict[str, Any]:
+        """
+        Minimal control snapshot for persistence/resume (no sensitive data).
+        """
+        return {
+            "attached_markets": list(self.markets.keys()),
+            "retired_markets": sorted(self._retired_markets),
+            "operator_flags": {
+                "pause_entries": self.pause_entries,
+                "pause_all": self.pause_all,
+            },
+            "strategy_config": asdict(self.strategy_config) if self.strategy_config else None,
+            "positions": self.get_positions(),
+            "capital": {"total": self.capital.total, "used": self.capital.used},
+            "cooldown_until": self._cooldown_until.isoformat() if self._cooldown_until else None,
+        }
+
+    def apply_control_state_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        """
+        Restore minimal control state. Does not open positions or resubscribe yet.
+        """
+        if not isinstance(snapshot, dict):
+            return
+
+        # Restore operator flags
+        flags = snapshot.get("operator_flags", {})
+        if isinstance(flags, dict):
+            self.pause_entries = bool(flags.get("pause_entries", self.pause_entries))
+            self.pause_all = bool(flags.get("pause_all", self.pause_all))
+
+        # Restore retired markets
+        retired = snapshot.get("retired_markets")
+        if isinstance(retired, (list, tuple, set)):
+            self._retired_markets = {str(m).upper() for m in retired if m}
+
+        # Restore attached markets as stubs (actual metadata/WS handled elsewhere)
+        attached = snapshot.get("attached_markets")
+        if isinstance(attached, (list, tuple, set)):
+            for m in attached:
+                if not m:
+                    continue
+                ticker = str(m).upper()
+                if ticker not in self.markets:
+                    self.markets[ticker] = MarketEntry(
+                        event_ticker="unknown", market_ticker=ticker
+                    )
+
+        # Optional strategy config restoration (best-effort)
+        cfg = snapshot.get("strategy_config")
+        if isinstance(cfg, dict):
+            try:
+                self.strategy_config = StrategyConfig(**cfg)
+            except Exception:
+                # Leave existing config untouched on failure
+                pass
+
+        # Restore cooldown
+        cooldown_val = snapshot.get("cooldown_until")
+        if isinstance(cooldown_val, str):
+            try:
+                self._cooldown_until = datetime.fromisoformat(cooldown_val)
+            except Exception:
+                self._cooldown_until = None
+        else:
+            self._cooldown_until = None
+
+        # Restore positions (paper). Best-effort; ignore malformed entries.
+        restored_positions = {}
+        max_pid = 0
+        positions = snapshot.get("positions")
+        if isinstance(positions, list):
+            for raw in positions:
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    pid = int(raw.get("id") or 0)
+                except Exception:
+                    pid = 0
+                status = raw.get("status") or "open"
+                qty = raw.get("qty") or 0
+                entry_price = raw.get("entry_price") or 0.0
+                current_price = raw.get("current_price")
+                if current_price is None:
+                    current_price = entry_price
+                try:
+                    qty_f = float(qty)
+                    entry_f = float(entry_price)
+                    current_f = float(current_price)
+                    computed_unrealized = (
+                        (entry_f - current_f) * qty_f if status.lower() == "open" else 0.0
+                    )
+                except Exception:
+                    computed_unrealized = 0.0
+                    current_price = entry_price
+
+                pos = Position(
+                    id=pid,
+                    event_ticker=(raw.get("event_ticker") or "").upper(),
+                    market_ticker=(raw.get("market_ticker") or "").upper(),
+                    side=(raw.get("side") or "NO").upper(),
+                    qty=qty,
+                    entry_price=entry_price,
+                    current_price=current_price,
+                    status=status,
+                    entry_ts=raw.get("entry_ts"),
+                    exit_ts=raw.get("exit_ts"),
+                    realized_pnl=raw.get("realized_pnl") or 0.0,
+                    unrealized_pnl=raw.get("unrealized_pnl") or computed_unrealized,
+                )
+                if pid > 0:
+                    max_pid = max(max_pid, pid)
+                restored_positions[pos.id] = pos
+
+        if restored_positions:
+            self.positions = restored_positions
+            self._next_position_id = max_pid + 1
+
+        # Restore capital totals/usage (best-effort)
+        cap = snapshot.get("capital")
+        if isinstance(cap, dict):
+            try:
+                self.capital.total = float(cap.get("total", self.capital.total))
+            except Exception:
+                pass
+        # Recompute used capital from open positions to ensure consistency
+        try:
+            self.capital.used = sum(
+                (p.entry_price or 0.0) * (p.qty or 0)
+                for p in self.positions.values()
+                if (p.status or "").lower() == "open"
+            )
+        except Exception:
+            # leave as-is on error
+            pass
     
     def _auto_close_positions_for_market(self, market_ticker: str) -> None:
         """
@@ -702,3 +1053,135 @@ class TradingEngine:
                 )
 
                 self.close_position(pos_id, reason="market_closed")
+
+        # After bulk auto-closes, detach market if no open positions remain
+        self._detach_market_if_idle(market_ticker)
+
+    def _detach_market_if_idle(self, market_ticker: str) -> None:
+        """
+        Remove a market + unsubscribe when no open positions remain.
+        Avoids re-entry on the same market without explicit re-attach.
+        """
+        market_ticker = (market_ticker or "").upper()
+        if not market_ticker:
+            return
+
+        has_open = any(
+            (p.market_ticker or "").upper() == market_ticker
+            and (p.status or "").lower() == "open"
+            for p in self.positions.values()
+        )
+        if has_open:
+            return
+
+        # Mark as retired to block future auto-entries
+        self._retired_markets.add(market_ticker)
+        self.remove_market(market_ticker)
+
+    def on_market_status(self, market_ticker: str, raw_status: str | None) -> None:
+        """
+        Handle lifecycle updates from WS (preferred over REST polling).
+        Maps the raw status to open/closed where possible and triggers auto-closes.
+        """
+        ticker = (market_ticker or "").upper()
+        if not ticker:
+            return
+
+        raw = (raw_status or "").lower()
+        mapped = raw
+
+        # Map Kalshi lifecycle event_types and statuses to open/closed
+        if raw in ("open", "trading", "live", "activated", "created"):
+            mapped = "open"
+        elif raw in (
+            "closed",
+            "settled",
+            "resolved",
+            "halted",
+            "deactivated",
+            "determined",
+        ):
+            mapped = "closed"
+        elif not raw:
+            mapped = "unknown"
+
+        market = self.markets.get(ticker)
+        if market is None:
+            market = MarketEntry(event_ticker="unknown", market_ticker=ticker, status=mapped)
+            self.markets[ticker] = market
+        else:
+            prev = market.status
+            if prev != mapped:
+                self.log(
+                    f"[MARKET_STATUS_WS] market={ticker} status={mapped} raw={raw_status} prev={prev}"
+                )
+            market.status = mapped
+
+        if mapped == "closed":
+            self._auto_close_positions_for_market(ticker)
+            # If no positions remain, detach and unsubscribe to keep streams clean
+            self._detach_market_if_idle(ticker)
+            # Persist control state when lifecycle forces detach/retire
+            self._persist_control_state()
+
+    def _circuit_breaker_allows_entry(self) -> tuple[bool, str]:
+        """
+        Enforce circuit breakers using ledger-derived stats and cooldowns.
+        """
+        cfg = self.strategy_config
+
+        # Cooldown after a stop-loss
+        if cfg.cooldown_minutes_after_stop and self._cooldown_until:
+            if datetime.utcnow() < self._cooldown_until:
+                return False, "cooldown_active"
+            # cooldown expired
+            self._cooldown_until = None
+
+        stats = compute_circuit_breaker_stats()
+
+        daily_limit = cfg.daily_loss_limit
+        if daily_limit is not None and stats["today_realized_pnl"] <= -abs(daily_limit):
+            return False, "daily_loss_cap"
+
+        dd_cap = cfg.max_drawdown
+        if dd_cap is not None and stats["max_drawdown"] >= abs(dd_cap):
+            return False, "max_drawdown_cap"
+
+        max_trades = cfg.max_trades_per_day
+        if max_trades is not None and stats["today_trades"] >= max_trades:
+            return False, "max_trades_per_day"
+
+        return True, "ok"
+
+    def detach_all_markets(self, force: bool = False) -> int:
+        """
+        Detach/unsubscribe all tracked markets.
+        If force=True, unsubscribe even if open positions exist.
+        Returns count of markets removed.
+        """
+        count = 0
+        for mt in list(self.markets.keys()):
+            ticker = mt.upper()
+            if force:
+                # Mark retired and drop without the open-position guard.
+                self._retired_markets.add(ticker)
+                self.markets.pop(ticker, None)
+                request_unsubscribe(ticker)
+                count += 1
+            else:
+                before = len(self.markets)
+                self.remove_market(ticker)
+                if len(self.markets) < before:
+                    count += 1
+        # Persist updated control state after bulk detach
+        self._persist_control_state()
+        return count
+
+    def _persist_control_state(self) -> None:
+        """
+        Best-effort persistence for control/trading state.
+        """
+        try:
+            engine_state_store.save_state(self.get_control_state_snapshot())
+        except Exception as e:
+            self.log(f"[PERSIST] failed to save state: {e}")

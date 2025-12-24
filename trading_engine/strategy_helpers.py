@@ -15,24 +15,31 @@ def can_open_new_position(
     qty: int,
     entry_price: float,
     total_capital: float,
-) -> bool:
+) -> tuple[bool, str]:
     """
     Pure helper that checks basic strategy limits for opening a new position.
+    Returns (allowed, reason). reason is non-empty when blocked.
     """
     if total_capital <= 0:
-        return False
+        return False, "no_capital"
 
     open_positions = [p for p in positions if p.status == "open"]
 
     # 1) Max number of open positions
     if len(open_positions) >= strategy_config.max_open_positions:
-        return False
+        return False, "max_open_positions"
 
     # 2) Per-position capital limit
     position_cost = qty * entry_price
     max_per_pos = total_capital * strategy_config.max_capital_per_position_pct
     if position_cost > max_per_pos:
-        return False
+        return False, "per_position_cap"
+
+    # 2b) Total exposure cap across all open positions
+    total_exposure = sum(p.entry_price * p.qty for p in open_positions)
+    max_total_exposure = total_capital * strategy_config.max_total_exposure_pct
+    if total_exposure + position_cost > max_total_exposure:
+        return False, "total_exposure_cap"
 
     # 3) Per-market capital limit
     market_ticker = market_ticker.upper()
@@ -43,9 +50,9 @@ def can_open_new_position(
     )
     max_per_market = total_capital * strategy_config.max_capital_per_market_pct
     if capital_in_market + position_cost > max_per_market:
-        return False
+        return False, "per_market_cap"
 
-    return True
+    return True, "ok"
 
 
 def pnl_exit_reason(pos: Position, cfg: StrategyConfig) -> Optional[str]:

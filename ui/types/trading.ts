@@ -37,6 +37,39 @@ export type TradingState = {
   positions: PositionView[];
   capital: Capital;
   markets: Record<string, MarketEntry>;
+  operator_flags?: {
+    pause_entries: boolean;
+    pause_all: boolean;
+  };
+  circuit_breakers?: {
+    cooldown_until?: string | null;
+    today_realized_pnl?: number;
+    today_trades?: number;
+    max_drawdown?: number;
+    limits?: {
+      daily_loss_limit?: number | null;
+      max_drawdown?: number | null;
+      max_trades_per_day?: number | null;
+      cooldown_minutes_after_stop?: number | null;
+    };
+  };
+  strategy_counters: {
+    auto_entries: number;
+    auto_exits: number;
+    skipped_entries_due_to_risk: number;
+    last_risk_skip_reason?: string | null;
+  };
+};
+
+export type HealthState = {
+  engine_running: boolean;
+  ws_connected: boolean;
+  ws_last_connect_ts?: string | null;
+  ws_last_message_ts?: string | null;
+  ws_last_error?: string | null;
+  ws_stale?: boolean;
+  ws_stale_seconds?: number | null;
+  ws_subscriptions?: number;
 };
 
 export type MarketEntry = {
