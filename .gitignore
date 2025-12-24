@@ -25,6 +25,8 @@ env/
 # Editor directories and files
 .vscode/
 .idea/
+.env
+*.pem
 
 # Mypy
 .mypy_cache/

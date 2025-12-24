@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  kalshi-bot:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      ENGINE_STATE_DB_PATH: /data/engine_state.sqlite
+      TRADE_LEDGER_DB_PATH: /data/trade_ledger.sqlite
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; resp=urllib.request.urlopen('http://localhost:8000/health', timeout=5); sys.exit(0 if resp.getcode()==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
