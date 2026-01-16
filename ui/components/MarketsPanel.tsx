@@ -1,7 +1,6 @@
 // ui/components/MarketsPanel.tsx
 "use client";
 
-import { useState } from "react";
 import { Button } from "@/components/ui/button";
 
 type MarketEntry = {
@@ -15,31 +14,12 @@ type MarketEntry = {
 type MarketsPanelProps = {
   markets: Record<string, MarketEntry>;
   loading: boolean;
+  onRemove: (marketTicker: string) => Promise<void> | void;
 };
 
-export function MarketsPanel({ markets, loading }: MarketsPanelProps) {
-  const [busyTicker, setBusyTicker] = useState<string | null>(null);
-
-  async function handleRefreshAndTrade(marketTicker: string) {
-    try {
-      setBusyTicker(marketTicker);
-
-      await fetch(
-        `http://127.0.0.1:8000/markets/${encodeURIComponent(
-          marketTicker
-        )}/refresh_and_trade`,
-        {
-          method: "POST",
-        }
-      );
-
-      // We rely on the main page's polling / manual Refresh button
-      // to pick up updated state (positions, prices, etc.).
-    } catch (err) {
-      console.error("Failed to refresh & trade NO:", err);
-    } finally {
-      setBusyTicker(null);
-    }
+export function MarketsPanel({ markets, loading, onRemove }: MarketsPanelProps) {
+  async function handleRemove(marketTicker: string) {
+    await onRemove(marketTicker);
   }
 
   const marketList = Object.values(markets ?? {});
@@ -56,8 +36,7 @@ export function MarketsPanel({ markets, loading }: MarketsPanelProps) {
 
       {!loading && marketList.length === 0 && (
         <p className="text-xs text-slate-500">
-          No markets attached yet. Use &quot;Event Markets&quot; to attach
-          one.
+          No markets attached yet. Use &quot;Event Markets&quot; to attach one.
         </p>
       )}
 
@@ -77,21 +56,20 @@ export function MarketsPanel({ markets, loading }: MarketsPanelProps) {
                 </div>
                 <div className="text-[11px] text-slate-500">
                   status: {m.status ?? "unknown"} | YES:{" "}
-                  {m.last_price_yes ?? "?"} | NO:{" "}
-                  {m.last_price_no ?? "?"}
+                  {m.last_price_yes ?? "?"} | NO: {m.last_price_no ?? "?"}
                 </div>
               </div>
-              <Button
-                type="button"
-                size="sm"
-                className="mt-1"
-                disabled={busyTicker === m.market_ticker}
-                onClick={() => handleRefreshAndTrade(m.market_ticker)}
-              >
-                {busyTicker === m.market_ticker
-                  ? "Trading…"
-                  : "Refresh & Trade NO"}
-              </Button>
+              <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="mt-1 border-slate-700 text-slate-200"
+                  onClick={() => handleRemove(m.market_ticker)}
+                >
+                  Remove
+                </Button>
+              </div>
             </li>
           ))}
         </ul>

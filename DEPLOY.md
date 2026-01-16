@@ -48,3 +48,25 @@ Docker Compose (local)
 - Uses `.env` for credentials/config.
 - Mounts `./data` to persist `engine_state.sqlite` and `trade_ledger.sqlite` (`ENGINE_STATE_DB_PATH` and `TRADE_LEDGER_DB_PATH` set to `/data/...` in compose).
 - Restart policy: unless-stopped. Healthcheck: HTTP GET `http://localhost:8000/health` (200 healthy, 500 degraded). Logs rotated via json-file (10m, 3 files).
+
+## NBA Engine Phase 5
+
+Demo vs live switch
+- Demo (default): `NBA_ENGINE_MODE=paper` (uses the paper adapter + sqlite ledger).
+- Live (stub): `NBA_ENGINE_MODE=live` (requires `KALSHI_REST_URL`; live adapter is a stub and must be implemented before trading).
+
+Required env vars
+- `STRATEGY_ARTIFACTS_PATH` (optional, default `strategy_artifacts.json`): strategy artifacts JSON.
+- `KALSHI_CANDLE_DB_PATH` (optional, default `data/phase1_candles.sqlite`): candle DB from phase1.
+- `KALSHI_PAPER_DB_PATH` (optional, default `data/paper_trades.sqlite`): paper trade ledger.
+- `NBA_ENGINE_MODE` (optional, default `paper`): `paper` or `live`.
+- `KALSHI_REST_URL` (live mode required): Kalshi REST base URL.
+- `KALSHI_KEY_ID`/`KALSHI_PRIVATE_KEY_PATH` (live mode required): credentials for REST signing (stubbed today).
+
+Safety checklist
+- Confirm `NBA_ENGINE_MODE=paper` for demos.
+- Verify `KALSHI_CANDLE_DB_PATH` points at an updating phase1 database.
+- Confirm `KALSHI_PAPER_DB_PATH` is persisted (e.g., mounted `data/`).
+- Check logs for `kill_switch_triggered` before enabling entries.
+- Verify cooldown and recent exits are respected before manual restarts.
+- If enabling live mode, implement the live adapter and validate against a test environment first.

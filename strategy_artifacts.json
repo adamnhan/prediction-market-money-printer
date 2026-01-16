@@ -1,0 +1,17 @@
+{
+  "vol_quantiles": {
+    "p10": 0.12,
+    "p50": 0.34,
+    "p90": 0.78
+  },
+  "volsum_quantiles": {
+    "p10": 10.0,
+    "p50": 25.0,
+    "p90": 60.0
+  },
+  "zscore": {
+    "mean": 0.0,
+    "std": 1.0
+  },
+  "quality_cutoff": 0.65
+}
