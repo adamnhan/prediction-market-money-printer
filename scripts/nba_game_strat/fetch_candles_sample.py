@@ -104,15 +104,19 @@ def fetch_event_candles(series_ticker: str, event_ticker: str) -> dict:
             raise
 
 
-def candle_yes_price(candle: dict) -> float | None:
+def _price_from_candle(candle: dict, field: str) -> float | None:
     price = candle.get("price", {})
-    close_dollars = price.get("close_dollars")
-    if close_dollars is not None:
-        return float(close_dollars)
-    close = price.get("close")
-    if close is not None:
-        return float(close) / 100.0
+    dollars = price.get(f"{field}_dollars")
+    if dollars is not None:
+        return float(dollars)
+    cents = price.get(field)
+    if cents is not None:
+        return float(cents) / 100.0
     return None
+
+
+def candle_yes_price(candle: dict) -> float | None:
+    return _price_from_candle(candle, "close")
 
 
 def main() -> None:
@@ -124,6 +128,7 @@ def main() -> None:
     status_map = load_market_status_map(json_path)
 
     rows: list[dict] = []
+    ohlcv_rows: list[dict] = []
 
     for event in events:
         event_id = event["event_id"]
@@ -143,6 +148,18 @@ def main() -> None:
                         "ts": ts,
                         "yes_price": yes_price,
                         "no_price": no_price,
+                        "volume": candle.get("volume"),
+                        "market_status": status_map.get(market_id, ""),
+                    }
+                )
+                ohlcv_rows.append(
+                    {
+                        "market_id": market_id,
+                        "ts": ts,
+                        "open_price": _price_from_candle(candle, "open"),
+                        "high_price": _price_from_candle(candle, "high"),
+                        "low_price": _price_from_candle(candle, "low"),
+                        "close_price": _price_from_candle(candle, "close"),
                         "volume": candle.get("volume"),
                         "market_status": status_map.get(market_id, ""),
                     }
@@ -168,6 +185,26 @@ def main() -> None:
         writer.writerows(rows)
 
     print(f"Saved candle sample to {output_csv}")
+
+    output_ohlcv_csv = repo_root / "data" / "nba_market_ohlcv_sample.csv"
+    with output_ohlcv_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "market_id",
+                "ts",
+                "open_price",
+                "high_price",
+                "low_price",
+                "close_price",
+                "volume",
+                "market_status",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(ohlcv_rows)
+
+    print(f"Saved OHLCV sample to {output_ohlcv_csv}")
 
 
 if __name__ == "__main__":

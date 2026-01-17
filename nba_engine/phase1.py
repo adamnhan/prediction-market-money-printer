@@ -12,6 +12,7 @@ import sqlite3
 import statistics
 import time
 import random
+import uuid
 from typing import Iterable
 from pathlib import Path
 from urllib.parse import urlparse
@@ -31,6 +32,13 @@ if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("[PHASE1] %(asctime)s %(message)s"))
     logger.addHandler(handler)
+
+
+KALSHI_L2_DB_PATH = os.getenv("KALSHI_L2_DB_PATH", "data/l2_orderbook.sqlite")
+KALSHI_L2_LOGGING = os.getenv("KALSHI_L2_LOGGING", "1") == "1"
+KALSHI_L2_CHECKPOINT_INTERVAL_S = int(os.getenv("KALSHI_L2_CHECKPOINT_INTERVAL_S", "60"))
+KALSHI_L2_LOG_EVERY_N = int(os.getenv("KALSHI_L2_LOG_EVERY_N", "1000"))
+KALSHI_MARKET_REFRESH_S = int(os.getenv("KALSHI_MARKET_REFRESH_S", "86400"))
 
 
 @dataclass
@@ -130,6 +138,133 @@ class CandleStore:
             ),
         )
         self.conn.commit()
+
+class L2Recorder:
+    def __init__(self, path: Path, checkpoint_interval_s: int, log_every_n: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(path))
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self._init_schema()
+        self.session_id = uuid.uuid4().hex
+        self.recv_idx = 0
+        self.msg_count = 0
+        self.log_every_n = max(1, log_every_n)
+        self.checkpoint_interval_ms = max(1, checkpoint_interval_s) * 1000
+        self.last_checkpoint_ms = 0
+
+    def _init_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS l2_messages (
+                id INTEGER PRIMARY KEY,
+                ts_utc_ms INTEGER NOT NULL,
+                market_ticker TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                seq INTEGER NULL,
+                payload_json TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                recv_idx INTEGER NOT NULL
+            );
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_l2_messages_ticker_ts ON l2_messages (market_ticker, ts_utc_ms);"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_l2_messages_ticker_seq ON l2_messages (market_ticker, seq);"
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS l2_checkpoints (
+                id INTEGER PRIMARY KEY,
+                ts_utc_ms INTEGER NOT NULL,
+                market_ticker TEXT NOT NULL,
+                bids_json TEXT NOT NULL,
+                asks_json TEXT NOT NULL,
+                top_bid REAL,
+                top_ask REAL,
+                levels_bid INTEGER NOT NULL,
+                levels_ask INTEGER NOT NULL
+            );
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_l2_checkpoints_ticker_ts ON l2_checkpoints (market_ticker, ts_utc_ms);"
+        )
+        self.conn.commit()
+
+    def log_message(self, market_ticker: str, channel: str, payload: dict, seq: int | None) -> None:
+        self.recv_idx += 1
+        self.msg_count += 1
+        ts_utc_ms = int(time.time() * 1000)
+        payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+        self.conn.execute(
+            """
+            INSERT INTO l2_messages (
+                ts_utc_ms, market_ticker, channel, seq, payload_json, session_id, recv_idx
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts_utc_ms,
+                market_ticker,
+                channel,
+                seq,
+                payload_json,
+                self.session_id,
+                self.recv_idx,
+            ),
+        )
+        self.conn.commit()
+        if self.msg_count % self.log_every_n == 0:
+            logger.info(
+                "l2_log count=%d last_ticker=%s last_type=%s last_seq=%s",
+                self.msg_count,
+                market_ticker,
+                channel,
+                seq,
+            )
+
+    def maybe_checkpoint(self, books: dict[str, dict[str, dict[int, int]]]) -> None:
+        now_ms = int(time.time() * 1000)
+        if now_ms - self.last_checkpoint_ms < self.checkpoint_interval_ms:
+            return
+        for market_ticker, book in books.items():
+            bids = sorted(
+                [(int(p), int(sz)) for p, sz in book.get("yes", {}).items() if sz and sz > 0],
+                reverse=True,
+            )
+            asks = sorted(
+                [(int(p), int(sz)) for p, sz in book.get("no", {}).items() if sz and sz > 0]
+            )
+            top_bid = bids[0][0] if bids else None
+            top_ask = asks[0][0] if asks else None
+            self.conn.execute(
+                """
+                INSERT INTO l2_checkpoints (
+                    ts_utc_ms, market_ticker, bids_json, asks_json, top_bid, top_ask, levels_bid, levels_ask
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_ms,
+                    market_ticker,
+                    json.dumps(bids, separators=(",", ":"), ensure_ascii=True),
+                    json.dumps(asks, separators=(",", ":"), ensure_ascii=True),
+                    top_bid,
+                    top_ask,
+                    len(bids),
+                    len(asks),
+                ),
+            )
+        self.conn.commit()
+        self.last_checkpoint_ms = now_ms
+        logger.info("l2_checkpoint ts_utc_ms=%d markets=%d", now_ms, len(books))
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
 class MarketState:
     def __init__(self, ticker: str) -> None:
@@ -492,6 +627,21 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
     logged_states = {log_ticker}
     db_path = Path(os.getenv("KALSHI_CANDLE_DB_PATH", "data/phase1_candles.sqlite"))
     store = CandleStore(db_path)
+    l2_recorder = None
+    l2_books: dict[str, dict[str, dict[int, int]]] = {}
+    if KALSHI_L2_LOGGING:
+        l2_recorder = L2Recorder(
+            Path(KALSHI_L2_DB_PATH),
+            KALSHI_L2_CHECKPOINT_INTERVAL_S,
+            KALSHI_L2_LOG_EVERY_N,
+        )
+        logger.info(
+            "l2_logging_enabled db=%s session_id=%s checkpoint_s=%d log_every_n=%d",
+            KALSHI_L2_DB_PATH,
+            l2_recorder.session_id,
+            KALSHI_L2_CHECKPOINT_INTERVAL_S,
+            KALSHI_L2_LOG_EVERY_N,
+        )
     pending_subscribe_ids: dict[int, str] = {}
     market_to_sid: dict[str, int] = {}
     inactive_tickers: set[str] = set()
@@ -542,17 +692,8 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
             )
             await asyncio.sleep(30)
 
-    async def health_timer() -> None:
-        while True:
-            uptime = datetime.now(timezone.utc) - started_at
-            for state in states.values():
-                last_candle = state.last_candle_minute.isoformat() if state.last_candle_minute else "none"
-                logger.info("health %s uptime=%s last_candle=%s", state.ticker, str(uptime), last_candle)
-            await asyncio.sleep(60)
-
     asyncio.create_task(candle_timer())
     asyncio.create_task(subscription_status_timer())
-    asyncio.create_task(health_timer())
 
     attempt = 0
     while True:
@@ -578,12 +719,46 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
                     }
                     await websocket.send(json.dumps(payload))
                     pending_subscribe_ids[sub_id] = ticker
-                    logger.info("subscribe_sent %s cmd_id=%d", ticker, sub_id)
                     sub_id += 1
+
+                async def market_refresh_timer() -> None:
+                    nonlocal sub_id, total_subscribe_requests
+                    if KALSHI_MARKET_REFRESH_S <= 0:
+                        return
+                    while True:
+                        await asyncio.sleep(KALSHI_MARKET_REFRESH_S)
+                        try:
+                            refreshed = await asyncio.to_thread(fetch_markets, rest_url, series_ticker)
+                            refreshed_tickers = set(select_market_tickers(refreshed))
+                            known_tickers = set(states.keys()) | inactive_tickers
+                            new_tickers = sorted(refreshed_tickers - known_tickers)
+                            if not new_tickers:
+                                logger.info("market_refresh checked=%d new=0", len(refreshed_tickers))
+                                continue
+                            logger.info("market_refresh checked=%d new=%d", len(refreshed_tickers), len(new_tickers))
+                            for ticker in new_tickers:
+                                states[ticker] = MarketState(ticker)
+                                payload = {
+                                    "id": sub_id,
+                                    "cmd": "subscribe",
+                                    "params": {
+                                        "channels": ["trade", "orderbook_delta", "market_lifecycle_v2"],
+                                        "market_ticker": ticker,
+                                    },
+                                }
+                                await websocket.send(json.dumps(payload))
+                                pending_subscribe_ids[sub_id] = ticker
+                                sub_id += 1
+                            total_subscribe_requests += len(new_tickers)
+                        except Exception as exc:
+                            logger.info("market_refresh_error error=%s", exc)
+
+                asyncio.create_task(market_refresh_timer())
 
                 async for message in websocket:
                     data = json.loads(message)
                     msg_type = data.get("type")
+                    msg = data.get("msg") or {}
                     if msg_type == "subscribed":
                         cmd_id = data.get("id")
                         sid = (data.get("msg") or {}).get("sid")
@@ -600,7 +775,6 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
                         "market_lifecycle",
                         "market_lifecycle_v2",
                     }:
-                        msg = data.get("msg") or {}
                         ticker = (msg.get("market_ticker") or msg.get("ticker") or "").upper()
                         state = (
                             msg.get("state") or msg.get("status") or msg.get("event_type") or ""
@@ -618,6 +792,34 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
                                 logger.info("unsubscribed %s state=%s", ticker, state)
                             states.pop(ticker, None)
                         continue
+
+                    if msg_type in {"orderbook_snapshot", "orderbook_delta"}:
+                        ticker = (msg.get("market_ticker") or msg.get("ticker") or "").upper()
+                        if ticker:
+                            if ticker not in l2_books:
+                                l2_books[ticker] = {"yes": {}, "no": {}}
+                            book = l2_books[ticker]
+                            if msg_type == "orderbook_snapshot":
+                                book["yes"] = {int(p): int(sz) for p, sz in (msg.get("yes") or [])}
+                                book["no"] = {int(p): int(sz) for p, sz in (msg.get("no") or [])}
+                            else:
+                                price = msg.get("price")
+                                delta = msg.get("delta")
+                                side = msg.get("side")
+                                if isinstance(price, int) and isinstance(delta, int) and side in ("yes", "no"):
+                                    prev = book[side].get(price, 0)
+                                    new_sz = prev + delta
+                                    if new_sz <= 0:
+                                        book[side].pop(price, None)
+                                    else:
+                                        book[side][price] = new_sz
+
+                        if l2_recorder:
+                            seq = msg.get("seq") if isinstance(msg.get("seq"), int) else msg.get("sequence")
+                            if not isinstance(seq, int):
+                                seq = None
+                            l2_recorder.log_message(ticker or "UNKNOWN", msg_type, data, seq)
+                            l2_recorder.maybe_checkpoint(l2_books)
 
                     tick = _extract_trade(data)
                     if not tick:
@@ -663,6 +865,9 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
             logger.info("ws_reconnect attempt=%d delay=%.2f error=%s", attempt + 1, delay, exc)
             attempt += 1
             await asyncio.sleep(delay)
+        finally:
+            if l2_recorder:
+                l2_recorder.close()
 
 
 def main() -> None:
