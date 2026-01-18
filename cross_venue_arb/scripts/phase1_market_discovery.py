@@ -15,6 +15,7 @@ if __package__ is None and str(Path(__file__).parents[2]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parents[2]))
 
 from cross_venue_arb.config import CONFIG
+from cross_venue_arb.matching.normalize import format_normalized_game, normalize_game
 
 
 logger = logging.getLogger("phase1_markets")
@@ -313,6 +314,15 @@ def _print_summary(markets: list[Market], venue: str, sample_size: int) -> None:
         print(f"- ... {len(subset) - sample_size} more")
 
 
+def _print_normalized_sample(games: list[object], venue: str, sample_size: int) -> None:
+    subset = [g for g in games if getattr(g, "venue", None) == venue]
+    print(f"{venue.capitalize()}: {len(subset)} normalized games")
+    for game in subset[:sample_size]:
+        print(f"- {format_normalized_game(game)}")
+    if sample_size < len(subset):
+        print(f"- ... {len(subset) - sample_size} more")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 1 market discovery")
     parser.add_argument("--series-ticker", default="KXNBAGAME", help="Kalshi series ticker")
@@ -355,9 +365,13 @@ def main() -> None:
     else:
         polymarket_raw = fetch_polymarket_markets()
     polymarket_markets = normalize_polymarket(polymarket_raw)
+    polymarket_games = [
+        normalize_game(market.raw or {}, venue="polymarket") for market in polymarket_markets
+    ]
 
     kalshi_raw = fetch_kalshi_markets(args.series_ticker)
     kalshi_markets = normalize_kalshi(kalshi_raw)
+    kalshi_games = [normalize_game(market.raw or {}, venue="kalshi") for market in kalshi_markets]
 
     all_markets = polymarket_markets + kalshi_markets
     write_json(Path(args.output), all_markets)
@@ -367,6 +381,8 @@ def main() -> None:
     else:
         _print_summary(all_markets, "polymarket", args.sample_size)
     _print_summary(all_markets, "kalshi", args.sample_size)
+    _print_normalized_sample(polymarket_games, "polymarket", args.sample_size)
+    _print_normalized_sample(kalshi_games, "kalshi", args.sample_size)
 
 
 if __name__ == "__main__":
