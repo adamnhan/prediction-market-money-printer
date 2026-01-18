@@ -28,10 +28,16 @@ def _parse_env_file(env_path: Path) -> dict[str, str]:
     return values
 
 
-def load_config(env_path: Path | None = None) -> Config:
+def load_env(env_path: Path | None = None) -> dict[str, str]:
     env_path = env_path or Path(".env")
-    file_values = _parse_env_file(env_path)
-    merged = {**file_values, **os.environ}
+    file_values: dict[str, str] = {}
+    if env_path.exists():
+        file_values = _parse_env_file(env_path)
+    return {**file_values, **os.environ}
+
+
+def load_config(env_path: Path | None = None) -> Config:
+    merged = load_env(env_path)
 
     required = ["KALSHI_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_WS_URL"]
     missing = [key for key in required if not merged.get(key)]

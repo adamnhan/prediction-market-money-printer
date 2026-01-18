@@ -21,7 +21,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from .artifacts import load_artifacts
-from .config import load_config
+from .config import load_config, load_env
 from .phase4 import (
     ActivityTracker,
     CandleRow,
@@ -705,11 +705,12 @@ def entry_decision(
 
 def run_loop() -> None:
     config = load_config()
-    artifacts_path = Path(os.getenv("STRATEGY_ARTIFACTS_PATH", "strategy_artifacts.json"))
+    env = load_env()
+    artifacts_path = Path(env.get("STRATEGY_ARTIFACTS_PATH", "strategy_artifacts.json"))
     artifacts = load_artifacts(artifacts_path)
 
-    candle_db_path = Path(os.getenv("KALSHI_CANDLE_DB_PATH", "data/phase1_candles.sqlite"))
-    paper_db_path = Path(os.getenv("KALSHI_PAPER_DB_PATH", "data/paper_trades.sqlite"))
+    candle_db_path = Path(env.get("KALSHI_CANDLE_DB_PATH", "data/phase1_candles.sqlite"))
+    paper_db_path = Path(env.get("KALSHI_PAPER_DB_PATH", "data/paper_trades.sqlite"))
 
     stream = CandleStream(candle_db_path)
     store = PaperStore(paper_db_path)
@@ -717,7 +718,7 @@ def run_loop() -> None:
     activity = ActivityTracker(_seed_activity(stream.conn))
     engine = SignalEngine(artifacts)
 
-    mode = os.getenv("NBA_ENGINE_MODE", "live").lower()
+    mode = env.get("NBA_ENGINE_MODE", "live").lower()
     rest_client: RestClient | None = None
     if mode == "live":
         if not config.kalshi_rest_url:
@@ -750,8 +751,8 @@ def run_loop() -> None:
         kill_switch = True
         _log_event("kill_switch_triggered", mean_pnl=mean_pnl, sample=sample_count)
 
-    force_ticker = os.getenv("FORCE_SIGNAL_TICKER")
-    force_direction = os.getenv("FORCE_SIGNAL_DIRECTION", "UNDERDOG_UP").upper()
+    force_ticker = env.get("FORCE_SIGNAL_TICKER")
+    force_direction = env.get("FORCE_SIGNAL_DIRECTION", "UNDERDOG_UP").upper()
     force_used = False
 
     def _fetch_balance() -> float | None:

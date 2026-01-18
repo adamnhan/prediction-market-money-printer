@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -11,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .artifacts import load_artifacts
-from .config import load_config
+from .config import load_config, load_env
 from .phase5 import RestClient, _extract_balance
 from .phase4 import _dashboard_html
 
@@ -240,10 +239,11 @@ def _active_cooldowns(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def build_dashboard_data() -> dict[str, Any]:
-    mode = os.getenv("NBA_ENGINE_MODE", "live").lower()
-    candle_db = Path(os.getenv("KALSHI_CANDLE_DB_PATH", "data/phase1_candles.sqlite"))
-    paper_db = Path(os.getenv("KALSHI_PAPER_DB_PATH", "data/paper_trades.sqlite"))
-    artifacts_path = Path(os.getenv("STRATEGY_ARTIFACTS_PATH", "strategy_artifacts.json"))
+    env = load_env()
+    mode = env.get("NBA_ENGINE_MODE", "live").lower()
+    candle_db = Path(env.get("KALSHI_CANDLE_DB_PATH", "data/phase1_candles.sqlite"))
+    paper_db = Path(env.get("KALSHI_PAPER_DB_PATH", "data/paper_trades.sqlite"))
+    artifacts_path = Path(env.get("STRATEGY_ARTIFACTS_PATH", "strategy_artifacts.json"))
     artifacts = load_artifacts(artifacts_path)
 
     candles_conn = sqlite3.connect(str(candle_db))
