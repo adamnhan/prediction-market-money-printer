@@ -584,6 +584,10 @@ def _extract_trade(data: dict) -> TradeTick | None:
         else:
             yes_price = float(raw_price)
 
+    if yes_price is not None and yes_price > 1.5:
+        # Normalize cent-based Kalshi prices (0-100) into 0-1 probabilities.
+        yes_price = float(yes_price) / 100.0
+
     volume = msg.get("volume")
     if volume is None:
         volume = msg.get("size") or msg.get("count") or msg.get("quantity")
@@ -733,7 +737,6 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
                             known_tickers = set(states.keys()) | inactive_tickers
                             new_tickers = sorted(refreshed_tickers - known_tickers)
                             if not new_tickers:
-                                logger.info("market_refresh checked=%d new=0", len(refreshed_tickers))
                                 continue
                             logger.info("market_refresh checked=%d new=%d", len(refreshed_tickers), len(new_tickers))
                             for ticker in new_tickers:

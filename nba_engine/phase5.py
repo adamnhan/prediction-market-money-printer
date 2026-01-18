@@ -8,6 +8,7 @@ import os
 import random
 import sqlite3
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -52,6 +53,8 @@ RISK_PCT = 0.0025
 MAX_NOTIONAL_PCT = 0.05
 OVERRIDE_CAP_PCT = 0.20
 CANCEL_AFTER = timedelta(seconds=60)
+KALSHI_DIAG_INTERVAL_S = int(os.getenv("KALSHI_DIAG_INTERVAL_S", "1800"))
+KALSHI_DIAG_MARKET_SAMPLE = int(os.getenv("KALSHI_DIAG_MARKET_SAMPLE", "5"))
 
 
 @dataclass(frozen=True)
@@ -736,6 +739,12 @@ def run_loop() -> None:
     pending_exits: dict[str, PendingOrder] = {}
     last_prices = _seed_last_prices(stream.conn, list(positions.keys()))
     kill_switch = False
+    last_candle_ts: dict[str, datetime] = {}
+    last_panic_ts: dict[str, datetime] = {}
+    last_entry_ts: dict[str, datetime] = {}
+    last_skip_reason: dict[str, str] = {}
+    interval_skip_counts: Counter[str] = Counter()
+    last_diag_ts = time.time()
     mean_pnl, sample_count = store.recent_mean_pnl(KILL_SWITCH_SAMPLE, artifacts.quality_cutoff)
     if sample_count == KILL_SWITCH_SAMPLE and mean_pnl is not None and mean_pnl < 0:
         kill_switch = True
@@ -980,6 +989,51 @@ def run_loop() -> None:
                     error=str(exc),
                 )
 
+    def _record_skip(market_ticker: str, reasons: list[str]) -> None:
+        if not reasons:
+            return
+        for reason in reasons:
+            interval_skip_counts[reason] += 1
+        last_skip_reason[market_ticker] = ",".join(reasons)
+
+    def _log_diag(now_ts: float) -> None:
+        if KALSHI_DIAG_INTERVAL_S <= 0:
+            return
+        nonlocal last_diag_ts, interval_skip_counts
+        if now_ts - last_diag_ts < KALSHI_DIAG_INTERVAL_S:
+            return
+        now = datetime.now(timezone.utc)
+        markets_seen = list(last_candle_ts.keys())
+        no_panic = [
+            m
+            for m in markets_seen
+            if (m not in last_panic_ts)
+            or (now - last_panic_ts[m] > timedelta(seconds=KALSHI_DIAG_INTERVAL_S))
+        ]
+        no_entry = [
+            m
+            for m in markets_seen
+            if (m not in last_entry_ts)
+            or (now - last_entry_ts[m] > timedelta(seconds=KALSHI_DIAG_INTERVAL_S))
+        ]
+        sample_markets = []
+        for m in no_entry[: max(KALSHI_DIAG_MARKET_SAMPLE, 0)]:
+            reason = last_skip_reason.get(m, "no_signal")
+            sample_markets.append(f"{m}:{reason}")
+        top_reasons = ",".join(
+            f"{k}:{v}" for k, v in interval_skip_counts.most_common(5)
+        )
+        _log_event(
+            "trade_inhibit_summary",
+            markets_seen=len(markets_seen),
+            no_panic=len(no_panic),
+            no_entry=len(no_entry),
+            top_reasons=top_reasons,
+            sample_markets=";".join(sample_markets),
+        )
+        interval_skip_counts = Counter()
+        last_diag_ts = now_ts
+
     while True:
         rows = stream.fetch_since(last_rowid)
         if not rows:
@@ -987,10 +1041,12 @@ def run_loop() -> None:
             continue
         for candle in rows:
             last_rowid = candle.rowid
+            last_candle_ts[candle.market_ticker] = candle.start_ts
             _refresh_pending(datetime.now(timezone.utc))
             active_last_3 = activity.update(candle.market_ticker, candle.trade_active)
             if candle.close == candle.close:
                 last_prices[candle.market_ticker] = candle.close
+            _log_diag(time.time())
 
             position = positions.get(candle.market_ticker)
             if position:
@@ -1126,6 +1182,7 @@ def run_loop() -> None:
                     vol_10=candle.vol_10,
                     vol_sum_5=candle.vol_sum_5,
                 )
+                last_panic_ts[candle.market_ticker] = candle.start_ts
                 force_used = True
                 _log_event(
                     "force_signal",
@@ -1149,6 +1206,7 @@ def run_loop() -> None:
                     if candle.market_ticker in pending_entries:
                         reasons.append("pending_entry")
                     if reasons:
+                        _record_skip(candle.market_ticker, reasons)
                         _log_event(
                             "skip_entry",
                             market_ticker=candle.market_ticker,
@@ -1172,6 +1230,7 @@ def run_loop() -> None:
                                 "buy",
                             )
                             if not depth.ok:
+                                _record_skip(candle.market_ticker, [f"entry_depth:{depth.reason}"])
                                 _log_event(
                                     "entry_depth_skip",
                                     market_ticker=candle.market_ticker,
@@ -1185,6 +1244,7 @@ def run_loop() -> None:
                                 pending.pop(candle.market_ticker, None)
                                 continue
                             if entry_price is None or qty <= 0:
+                                _record_skip(candle.market_ticker, ["entry_size"])
                                 _log_event(
                                     "entry_size_skip",
                                     market_ticker=candle.market_ticker,
@@ -1216,6 +1276,7 @@ def run_loop() -> None:
                                 panic, candle, active_last_3
                             )
                         if eval_reasons:
+                            _record_skip(candle.market_ticker, eval_reasons)
                             _log_event(
                                 "skip_entry",
                                 market_ticker=candle.market_ticker,
@@ -1230,6 +1291,7 @@ def run_loop() -> None:
                             pending.pop(candle.market_ticker, None)
                             continue
                         if not allowed:
+                            _record_skip(candle.market_ticker, ["not_allowed"])
                             pending.pop(candle.market_ticker, None)
                             continue
                         order_key = _entry_order_key(panic)
@@ -1270,6 +1332,7 @@ def run_loop() -> None:
                                     effective_capital=_effective_capital(balance) if balance is not None else None,
                                     notional=_position_notional(balance) if balance is not None else None,
                                 )
+                                last_entry_ts[candle.market_ticker] = candle.start_ts
                             else:
                                 new_position = Position(
                                     id=result.order_id,
@@ -1295,6 +1358,7 @@ def run_loop() -> None:
                                     p_open=panic.p_open,
                                     p_base=panic.p_base,
                                 )
+                                last_entry_ts[candle.market_ticker] = candle.start_ts
                         else:
                             _log_event(
                                 "entry_deduped",
@@ -1307,6 +1371,7 @@ def run_loop() -> None:
             panic = engine.detect_panic(candle)
             if panic:
                 pending[candle.market_ticker] = panic
+                last_panic_ts[candle.market_ticker] = panic.detected_ts
                 _log_event(
                     "panic_detected",
                     market_ticker=candle.market_ticker,

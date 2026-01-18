@@ -6,6 +6,10 @@ import base64
 import random
 from datetime import datetime, timezone, timedelta
 import json
+import sqlite3
+import time
+import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 
@@ -43,6 +47,9 @@ KALSHI_WS_URL = os.getenv(
 
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID")
 KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+KALSHI_L2_DB_PATH = os.getenv("KALSHI_L2_DB_PATH", "data/l2_orderbook.sqlite")
+KALSHI_L2_LOGGING = os.getenv("KALSHI_L2_LOGGING", "1") == "1"
+KALSHI_L2_CHECKPOINT_INTERVAL_S = int(os.getenv("KALSHI_L2_CHECKPOINT_INTERVAL_S", "60"))
 
 SUBSCRIBE_QUEUE: asyncio.Queue[str] = asyncio.Queue()
 # Simple in-memory book: market_ticker -> {"yes": {price: size}, "no": {price: size}}
@@ -66,6 +73,121 @@ WS_STATE = {
     "last_error": None,
     "stale": False,
 }
+
+class L2Recorder:
+    def __init__(self, db_path: str, checkpoint_interval_s: int) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self._setup_schema()
+        self.session_id = uuid.uuid4().hex
+        self.recv_idx = 0
+        self.checkpoint_interval_ms = max(1, checkpoint_interval_s) * 1000
+        self.last_checkpoint_ms = 0
+
+    def _setup_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS l2_messages (
+                id INTEGER PRIMARY KEY,
+                ts_utc_ms INTEGER NOT NULL,
+                market_ticker TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                seq INTEGER NULL,
+                payload_json TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                recv_idx INTEGER NOT NULL
+            );
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_l2_messages_ticker_ts ON l2_messages (market_ticker, ts_utc_ms);"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_l2_messages_ticker_seq ON l2_messages (market_ticker, seq);"
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS l2_checkpoints (
+                id INTEGER PRIMARY KEY,
+                ts_utc_ms INTEGER NOT NULL,
+                market_ticker TEXT NOT NULL,
+                bids_json TEXT NOT NULL,
+                asks_json TEXT NOT NULL,
+                top_bid REAL,
+                top_ask REAL,
+                levels_bid INTEGER NOT NULL,
+                levels_ask INTEGER NOT NULL
+            );
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_l2_checkpoints_ticker_ts ON l2_checkpoints (market_ticker, ts_utc_ms);"
+        )
+
+    def log_message(self, market_ticker: str, channel: str, payload: dict, seq: int | None) -> None:
+        self.recv_idx += 1
+        ts_utc_ms = int(time.time() * 1000)
+        payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+        self.conn.execute(
+            """
+            INSERT INTO l2_messages (
+                ts_utc_ms, market_ticker, channel, seq, payload_json, session_id, recv_idx
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts_utc_ms,
+                market_ticker,
+                channel,
+                seq,
+                payload_json,
+                self.session_id,
+                self.recv_idx,
+            ),
+        )
+        self.conn.commit()
+
+    def maybe_checkpoint(self) -> None:
+        now_ms = int(time.time() * 1000)
+        if now_ms - self.last_checkpoint_ms < self.checkpoint_interval_ms:
+            return
+        for market_ticker, book in BOOKS.items():
+            bids = sorted(
+                [(int(p), int(sz)) for p, sz in book.get("yes", {}).items() if sz and sz > 0],
+                reverse=True,
+            )
+            asks = sorted(
+                [(int(p), int(sz)) for p, sz in book.get("no", {}).items() if sz and sz > 0]
+            )
+            top_bid = bids[0][0] if bids else None
+            top_ask = asks[0][0] if asks else None
+            self.conn.execute(
+                """
+                INSERT INTO l2_checkpoints (
+                    ts_utc_ms, market_ticker, bids_json, asks_json, top_bid, top_ask, levels_bid, levels_ask
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_ms,
+                    market_ticker,
+                    json.dumps(bids, separators=(",", ":"), ensure_ascii=True),
+                    json.dumps(asks, separators=(",", ":"), ensure_ascii=True),
+                    top_bid,
+                    top_ask,
+                    len(bids),
+                    len(asks),
+                ),
+            )
+        self.conn.commit()
+        self.last_checkpoint_ms = now_ms
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
 
 def _log_event(event: str, **fields: object) -> None:
@@ -155,118 +277,135 @@ async def _connect_once(engine: "TradingEngine"):
     if headers is None:
         return
 
-    async with websockets.connect(
-        KALSHI_WS_URL,
-        additional_headers=headers,
-    ) as websocket:
-        _log_event("WS_CONNECTED")
-        WS_STATE["connected"] = True
-        WS_STATE["last_connect_ts"] = datetime.now(timezone.utc).isoformat()
+    recorder = None
+    if KALSHI_L2_LOGGING:
+        recorder = L2Recorder(KALSHI_L2_DB_PATH, KALSHI_L2_CHECKPOINT_INTERVAL_S)
+        _log_event("WS_L2_LOGGING_ENABLED", db=str(recorder.db_path), session_id=recorder.session_id)
 
-        # Reset subscription tracking on each (re)connect; sids are connection-scoped
-        ACTIVE_SUBSCRIPTIONS.clear()
-        MARKET_TO_SID.clear()
-        PENDING_SUBSCRIBE_IDS.clear()
+    try:
+        async with websockets.connect(
+            KALSHI_WS_URL,
+            additional_headers=headers,
+        ) as websocket:
+            _log_event("WS_CONNECTED")
+            WS_STATE["connected"] = True
+            WS_STATE["last_connect_ts"] = datetime.now(timezone.utc).isoformat()
 
-        # On new connection, re-subscribe to already tracked markets
-        for ticker in engine.markets.keys():
-            SUBSCRIBE_QUEUE.put_nowait(ticker)
-            _log_event("WS_RESUBSCRIBE_QUEUED", ticker=ticker)
+            # Reset subscription tracking on each (re)connect; sids are connection-scoped
+            ACTIVE_SUBSCRIPTIONS.clear()
+            MARKET_TO_SID.clear()
+            PENDING_SUBSCRIBE_IDS.clear()
 
-        # --- subscription worker (runs concurrently) ---
-        async def subscription_worker():
-            sub_id = 1
-            while True:
-                ticker = await SUBSCRIBE_QUEUE.get()
-                ticker = ticker.upper()
+            # On new connection, re-subscribe to already tracked markets
+            for ticker in engine.markets.keys():
+                SUBSCRIBE_QUEUE.put_nowait(ticker)
+                _log_event("WS_RESUBSCRIBE_QUEUED", ticker=ticker)
 
-                if ticker in ACTIVE_SUBSCRIPTIONS or ticker in PENDING_SUBSCRIBE_IDS.values():
-                    _log_event("WS_SUBSCRIBE_SKIP_DUP", ticker=ticker)
-                    continue
+            # --- subscription worker (runs concurrently) ---
+            async def subscription_worker():
+                sub_id = 1
+                while True:
+                    ticker = await SUBSCRIBE_QUEUE.get()
+                    ticker = ticker.upper()
 
-                msg = {
-                    "id": sub_id,
-                    "cmd": "subscribe",
-                    "params": {
-                        # Subscribe to orderbook deltas and lifecycle updates for this market
-                        "channels": ["orderbook_delta", "market_lifecycle_v2"],
-                        "market_ticker": ticker,
-                    },
-                }
-                PENDING_SUBSCRIBE_IDS[sub_id] = ticker
+                    if ticker in ACTIVE_SUBSCRIPTIONS or ticker in PENDING_SUBSCRIBE_IDS.values():
+                        _log_event("WS_SUBSCRIBE_SKIP_DUP", ticker=ticker)
+                        continue
 
-                await websocket.send(json.dumps(msg))
-                _log_event("WS_SUBSCRIBE_SENT", ticker=ticker, cmd_id=sub_id)
-                sub_id += 1
-                ACTIVE_SUBSCRIPTIONS.add(ticker)
+                    msg = {
+                        "id": sub_id,
+                        "cmd": "subscribe",
+                        "params": {
+                            # Subscribe to orderbook deltas and lifecycle updates for this market
+                            "channels": ["orderbook_delta", "market_lifecycle_v2"],
+                            "market_ticker": ticker,
+                        },
+                    }
+                    PENDING_SUBSCRIBE_IDS[sub_id] = ticker
 
-        # start subscription loop
-        asyncio.create_task(subscription_worker())
-        async def unsubscribe_worker():
-            unsub_id = 10_000  # separate id space from subscribe ids
-            while True:
-                ticker = await UNSUBSCRIBE_QUEUE.get()
-                ticker = ticker.upper()
+                    await websocket.send(json.dumps(msg))
+                    _log_event("WS_SUBSCRIBE_SENT", ticker=ticker, cmd_id=sub_id)
+                    sub_id += 1
+                    ACTIVE_SUBSCRIPTIONS.add(ticker)
 
-                sid = MARKET_TO_SID.get(ticker)
-                if sid is None:
-                    logger.info(f"Unsubscribe requested for {ticker}, but no sid known yet; queueing removal.")
+            # start subscription loop
+            asyncio.create_task(subscription_worker())
+            async def unsubscribe_worker():
+                unsub_id = 10_000  # separate id space from subscribe ids
+                while True:
+                    ticker = await UNSUBSCRIBE_QUEUE.get()
+                    ticker = ticker.upper()
+
+                    sid = MARKET_TO_SID.get(ticker)
+                    if sid is None:
+                        logger.info(f"Unsubscribe requested for {ticker}, but no sid known yet; queueing removal.")
+                        ACTIVE_SUBSCRIPTIONS.discard(ticker)
+                        continue
+
+                    msg = {
+                        "id": unsub_id,
+                        "cmd": "unsubscribe",
+                        "params": {"sids": [sid]},
+                    }
+                    await websocket.send(json.dumps(msg))
+                    _log_event("WS_UNSUBSCRIBE_SENT", ticker=ticker, sid=sid, cmd_id=unsub_id)
+                    unsub_id += 1
                     ACTIVE_SUBSCRIPTIONS.discard(ticker)
-                    continue
 
-                msg = {
-                    "id": unsub_id,
-                    "cmd": "unsubscribe",
-                    "params": {"sids": [sid]},
-                }
-                await websocket.send(json.dumps(msg))
-                _log_event("WS_UNSUBSCRIBE_SENT", ticker=ticker, sid=sid, cmd_id=unsub_id)
-                unsub_id += 1
-                ACTIVE_SUBSCRIPTIONS.discard(ticker)
+            asyncio.create_task(unsubscribe_worker())
 
-        asyncio.create_task(unsubscribe_worker())
-
-        # --- receive loop ---
-        async for message in websocket:
-            WS_STATE["last_message_ts"] = datetime.now(timezone.utc).isoformat()
-            WS_STATE["stale"] = False
-            try:
-                data = json.loads(message)
-                msg_type = data.get("type")
-
-                # WS lifecycle/state updates (prefer over REST polling)
-                if msg_type in {"market_state", "market_status", "market_lifecycle", "market_lifecycle_v2"}:
+            # --- receive loop ---
+            async for message in websocket:
+                WS_STATE["last_message_ts"] = datetime.now(timezone.utc).isoformat()
+                WS_STATE["stale"] = False
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type")
                     msg = data.get("msg") or {}
-                    ticker = (msg.get("market_ticker") or msg.get("ticker") or "").upper()
-                    # v2 lifecycle uses event_type (created, activated, deactivated, determined, settled)
-                    state = msg.get("state") or msg.get("status") or msg.get("event_type")
 
-                    # Ignore lifecycle noise for markets we didn't subscribe to
-                    if ticker and state:
-                        if ticker not in ACTIVE_SUBSCRIPTIONS and ticker not in PENDING_SUBSCRIBE_IDS.values():
-                            logger.info(f"[WS] Ignoring lifecycle for unsubscribed market {ticker} state={state}")
-                            continue
-                        _log_event("WS_LIFECYCLE", ticker=ticker, state=state)
-                        engine.on_market_status(ticker, state)
-                    continue
+                    # WS lifecycle/state updates (prefer over REST polling)
+                    if msg_type in {"market_state", "market_status", "market_lifecycle", "market_lifecycle_v2"}:
+                        ticker = (msg.get("market_ticker") or msg.get("ticker") or "").upper()
+                        # v2 lifecycle uses event_type (created, activated, deactivated, determined, settled)
+                        state = msg.get("state") or msg.get("status") or msg.get("event_type")
 
-                # Map Kalshi "subscribed" response -> sid -> ticker
-                if msg_type == "subscribed":
-                    cmd_id = data.get("id")
-                    sid = (data.get("msg") or {}).get("sid")
-                    if isinstance(cmd_id, int) and isinstance(sid, int):
-                        ticker = PENDING_SUBSCRIBE_IDS.pop(cmd_id, None)
-                        if ticker:
-                            MARKET_TO_SID[ticker] = sid
-                            ACTIVE_SUBSCRIPTIONS.add(ticker.upper())
-                            _log_event("WS_SUBSCRIBED", ticker=ticker, sid=sid, cmd_id=cmd_id)
+                        # Ignore lifecycle noise for markets we didn't subscribe to
+                        if ticker and state:
+                            if ticker not in ACTIVE_SUBSCRIPTIONS and ticker not in PENDING_SUBSCRIBE_IDS.values():
+                                logger.info(f"[WS] Ignoring lifecycle for unsubscribed market {ticker} state={state}")
+                                continue
+                            _log_event("WS_LIFECYCLE", ticker=ticker, state=state)
+                            engine.on_market_status(ticker, state)
+                        continue
 
-                normalized = normalize_orderbook_message(data)
-                update = MarketUpdate(**normalized)
-                engine.on_market_update(update)
-            except Exception as exc:
-                WS_STATE["last_error"] = str(exc)
-                logger.error(f"Failed to process WS message: {exc}", exc_info=True)
+                    # Map Kalshi "subscribed" response -> sid -> ticker
+                    if msg_type == "subscribed":
+                        cmd_id = data.get("id")
+                        sid = (data.get("msg") or {}).get("sid")
+                        if isinstance(cmd_id, int) and isinstance(sid, int):
+                            ticker = PENDING_SUBSCRIBE_IDS.pop(cmd_id, None)
+                            if ticker:
+                                MARKET_TO_SID[ticker] = sid
+                                ACTIVE_SUBSCRIPTIONS.add(ticker.upper())
+                                _log_event("WS_SUBSCRIBED", ticker=ticker, sid=sid, cmd_id=cmd_id)
+
+                    if recorder and msg_type in {"orderbook_snapshot", "orderbook_delta"}:
+                        ticker = (msg.get("market_ticker") or "").upper()
+                        seq = msg.get("seq") if isinstance(msg.get("seq"), int) else msg.get("sequence")
+                        if isinstance(seq, int) or seq is None:
+                            recorder.log_message(ticker, msg_type, data, seq)
+
+                    normalized = normalize_orderbook_message(data)
+                    update = MarketUpdate(**normalized)
+                    engine.on_market_update(update)
+                    if recorder and msg_type in {"orderbook_snapshot", "orderbook_delta"}:
+                        recorder.maybe_checkpoint()
+                except Exception as exc:
+                    WS_STATE["last_error"] = str(exc)
+                    logger.error(f"Failed to process WS message: {exc}", exc_info=True)
+    finally:
+        if recorder:
+            recorder.close()
 
 
 async def connect_and_listen(engine: "TradingEngine"):
