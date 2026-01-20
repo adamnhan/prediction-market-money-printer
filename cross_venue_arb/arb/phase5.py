@@ -18,6 +18,8 @@ class Phase5Config:
     buffer_per_contract: float = 0.005
     kalshi_fee_per_contract: float = 0.001
     polymarket_fee_per_contract: float = 0.0
+    fresh_s: float = 0.25
+    sync_s: float = 0.05
     emit_cooldown_s: float = 10.0
     confirm_ticks: int = 2
 
@@ -107,6 +109,9 @@ def _evaluate_pair(
     if not book_a or not book_b or not book_poly:
         return Opportunity(record.game_key, ts, "invalid", 0, 0, 0, [], "missing_book")
 
+    if not _books_synced(book_poly, book_b, ts, config):
+        return Opportunity(record.game_key, ts, "invalid", 0, 0, 0, [], "unsynced_books")
+
     ask_a = book_a.best_ask[0] if book_a.best_ask else None
     ask_b = book_b.best_ask[0] if book_b.best_ask else None
     ask_poly = book_poly.best_ask[0] if book_poly.best_ask else None
@@ -184,3 +189,17 @@ def _kalshi_team_map(team_markets: list[dict]) -> dict[str, str]:
 def _estimate_fee(venue: str, fee_per_contract: float) -> float:
     _ = venue
     return fee_per_contract
+
+
+def _books_synced(book_a: object, book_b: object, now: float, config: Phase5Config) -> bool:
+    ts_a = getattr(book_a, "last_update_ts", None)
+    ts_b = getattr(book_b, "last_update_ts", None)
+    if ts_a is None or ts_b is None:
+        return False
+    if now - ts_a > config.fresh_s:
+        return False
+    if now - ts_b > config.fresh_s:
+        return False
+    if abs(ts_a - ts_b) > config.sync_s:
+        return False
+    return True
