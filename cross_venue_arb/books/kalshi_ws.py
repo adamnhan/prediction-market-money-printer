@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import random
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -44,13 +45,13 @@ def _load_private_key() -> object | None:
         return None
 
 
-def _build_auth_headers(private_key: object) -> dict[str, str] | None:
+def _build_auth_headers(private_key: object, request_path: str) -> dict[str, str] | None:
     if not CONFIG.kalshi.key_id:
         logger.error("KALSHI_KEY_ID not set.")
         return None
     now = datetime.now(timezone.utc)
     timestamp_ms = int(now.timestamp() * 1000)
-    message = f"{timestamp_ms}GET/trade-api/ws/v2".encode("utf-8")
+    message = f"{timestamp_ms}GET{request_path}".encode("utf-8")
     try:
         signature = private_key.sign(
             message,
@@ -111,11 +112,9 @@ async def run(
     tickers: Iterable[str],
 ) -> None:
     ws_url = CONFIG.kalshi.ws_url or "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    request_path = urlsplit(ws_url).path or "/trade-api/ws/v2"
     private_key = _load_private_key()
     if private_key is None:
-        return
-    headers = _build_auth_headers(private_key)
-    if headers is None:
         return
 
     tickers = [ticker.upper() for ticker in tickers]
@@ -123,6 +122,9 @@ async def run(
 
     while True:
         try:
+            headers = _build_auth_headers(private_key, request_path)
+            if headers is None:
+                raise RuntimeError("missing_kalshi_auth")
             async with websockets.connect(ws_url, additional_headers=headers) as websocket:
                 logger.info("connected")
                 backoff = 1.0

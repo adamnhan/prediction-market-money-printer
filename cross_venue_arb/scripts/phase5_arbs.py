@@ -21,6 +21,7 @@ from cross_venue_arb.arb.phase5 import OpportunityTracker, Phase5Config, evaluat
 from cross_venue_arb.books.kalshi_ws import run as kalshi_ws
 from cross_venue_arb.books.manager import BookManager
 from cross_venue_arb.books.polymarket_ws import run as polymarket_ws
+from cross_venue_arb.safety import assert_no_live_trading
 from cross_venue_arb.storage.mapping_registry import GameMappingRecord, read_game_mappings
 
 
@@ -28,6 +29,15 @@ from cross_venue_arb.storage.mapping_registry import GameMappingRecord, read_gam
 class GameView:
     record: GameMappingRecord
     polymarket_asset_ids: list[str]
+    kalshi_tickers: list[str]
+
+
+@dataclass
+class SyncState:
+    last_kalshi_ts: float | None = None
+    last_poly_ts: float | None = None
+    kalshi_dirty: bool = False
+    poly_dirty: bool = False
 
 
 def _build_views(records: list[GameMappingRecord]) -> list[GameView]:
@@ -35,8 +45,28 @@ def _build_views(records: list[GameMappingRecord]) -> list[GameView]:
     for record in records:
         details = record.match_details or {}
         asset_ids = details.get("polymarket_asset_ids") or []
-        views.append(GameView(record=record, polymarket_asset_ids=asset_ids))
+        kalshi_tickers = [
+            entry.get("ticker") for entry in record.kalshi_team_markets if entry.get("ticker")
+        ]
+        views.append(
+            GameView(
+                record=record,
+                polymarket_asset_ids=asset_ids,
+                kalshi_tickers=kalshi_tickers,
+            )
+        )
     return views
+
+
+def _mark_dirty(state: SyncState, manager: BookManager, view: GameView) -> None:
+    kalshi_ts = manager.latest_update_ts("kalshi", view.kalshi_tickers)
+    if kalshi_ts is not None and (state.last_kalshi_ts is None or kalshi_ts > state.last_kalshi_ts):
+        state.last_kalshi_ts = kalshi_ts
+        state.kalshi_dirty = True
+    poly_ts = manager.latest_update_ts("polymarket", view.polymarket_asset_ids)
+    if poly_ts is not None and (state.last_poly_ts is None or poly_ts > state.last_poly_ts):
+        state.last_poly_ts = poly_ts
+        state.poly_dirty = True
 
 
 def _print_opportunity(opp: Opportunity) -> None:
@@ -61,8 +91,15 @@ async def _arb_loop(
     interval_s: float,
 ) -> None:
     tracker = OpportunityTracker(config.emit_cooldown_s)
+    states: dict[str, SyncState] = {}
     while True:
         for view in views:
+            state = states.setdefault(view.record.game_key, SyncState())
+            _mark_dirty(state, manager, view)
+            if not (state.kalshi_dirty and state.poly_dirty):
+                continue
+            state.kalshi_dirty = False
+            state.poly_dirty = False
             for opp in evaluate_game(view.record, manager, config):
                 if opp.reject_reason:
                     if tracker.should_emit(f"rej:{opp.game_key}:{opp.direction}:{opp.reject_reason}", 0.0):
@@ -85,7 +122,10 @@ async def main() -> None:
     parser.add_argument("--kalshi-fee", type=float, default=0.001, help="Kalshi fee per contract")
     parser.add_argument("--poly-fee", type=float, default=0.0, help="Polymarket fee per contract")
     parser.add_argument("--confirm-ticks", type=int, default=2, help="Consecutive ticks required")
+    parser.add_argument("--fresh-ms", type=int, default=1500, help="Max age for leg updates (ms)")
+    parser.add_argument("--sync-ms", type=int, default=400, help="Max cross-venue timestamp delta (ms)")
     args = parser.parse_args()
+    assert_no_live_trading()
 
     records = read_game_mappings(as_of_date=args.as_of_date)
     if not records:
@@ -112,6 +152,8 @@ async def main() -> None:
         kalshi_fee_per_contract=args.kalshi_fee,
         polymarket_fee_per_contract=args.poly_fee,
         confirm_ticks=args.confirm_ticks,
+        fresh_ms=args.fresh_ms,
+        sync_ms=args.sync_ms,
     )
 
     await asyncio.gather(

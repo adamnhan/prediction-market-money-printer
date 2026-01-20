@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -17,6 +18,7 @@ from .phase4 import _dashboard_html
 
 COOLDOWN = timedelta(minutes=10)
 KILL_SWITCH_SAMPLE = 100
+NULL_CANDLE_WARN_AFTER = timedelta(minutes=30)
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,29 @@ def _fetch_latest_candles(conn: sqlite3.Connection, limit: int = 60) -> list[Can
             )
         )
     return snapshots
+
+
+def _null_candle_warning(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    cutoff = (datetime.now(timezone.utc) - NULL_CANDLE_WARN_AFTER).isoformat()
+    rows = conn.execute(
+        "SELECT close FROM candles WHERE start_ts >= ?",
+        (cutoff,),
+    ).fetchall()
+    if not rows:
+        return None
+    for row in rows:
+        value = row[0]
+        if value is None:
+            continue
+        try:
+            if not math.isnan(float(value)):
+                return None
+        except (TypeError, ValueError):
+            continue
+    return {
+        "event": "warning candles closed at null for the past 30 minutes",
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _fetch_open_positions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -250,6 +275,10 @@ def build_dashboard_data() -> dict[str, Any]:
     paper_conn = sqlite3.connect(str(paper_db))
 
     markets = _fetch_latest_candles(candles_conn)
+    logs: list[dict[str, Any]] = []
+    null_warning = _null_candle_warning(candles_conn)
+    if null_warning:
+        logs.append(null_warning)
     portfolio_balance = None
     if mode == "live":
         try:
@@ -264,6 +293,12 @@ def build_dashboard_data() -> dict[str, Any]:
                 portfolio_balance = _extract_balance(payload)
         except Exception:
             portfolio_balance = None
+    override_raw = env.get("KALSHI_BALANCE_OVERRIDE")
+    if override_raw:
+        try:
+            portfolio_balance = float(override_raw)
+        except ValueError:
+            pass
     positions_raw = _fetch_open_positions(paper_conn)
     recent_trades = _fetch_recent_trades(paper_conn)
     closed_pnls = _fetch_closed_pnls(paper_conn)
@@ -334,7 +369,7 @@ def build_dashboard_data() -> dict[str, Any]:
         ],
         "positions": positions,
         "trades": recent_trades,
-        "logs": [],
+        "logs": logs,
         "last_update": last_update,
     }
 

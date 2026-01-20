@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from typing import Dict
+from typing import Dict, Iterable
 
 from cross_venue_arb.books.book import OrderBook
 
@@ -67,6 +67,15 @@ class BookManager:
         if book is None or book.last_update_ts is None:
             return None
         return time.monotonic() - book.last_update_ts
+
+    def latest_update_ts(self, venue: str, market_ids: Iterable[str]) -> float | None:
+        latest: float | None = None
+        for market_id in market_ids:
+            book = self.get_book(venue, market_id)
+            if book is None or book.last_update_ts is None:
+                continue
+            latest = book.last_update_ts if latest is None else max(latest, book.last_update_ts)
+        return latest
 
     def venues(self) -> list[str]:
         return list(self._books.keys())

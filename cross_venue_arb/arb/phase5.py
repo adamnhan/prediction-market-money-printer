@@ -20,6 +20,8 @@ class Phase5Config:
     polymarket_fee_per_contract: float = 0.0
     emit_cooldown_s: float = 10.0
     confirm_ticks: int = 2
+    fresh_ms: int = 1500
+    sync_ms: int = 400
 
 
 class OpportunityTracker:
@@ -54,6 +56,9 @@ def evaluate_game(
     team_map = _kalshi_team_map(record.kalshi_team_markets)
     if len(team_map) < 2:
         return [Opportunity(record.game_key, ts, "invalid", 0, 0, 0, [], "missing_teams")]
+    gate_reason = _sync_gate(record, manager, config, now_ts=ts)
+    if gate_reason:
+        return [Opportunity(record.game_key, ts, "invalid", 0, 0, 0, [], gate_reason)]
 
     outcomes = list(team_map.keys())[:2]
     team0, team1 = outcomes[0], outcomes[1]
@@ -179,6 +184,41 @@ def _kalshi_team_map(team_markets: list[dict]) -> dict[str, str]:
         if team and ticker:
             mapping[team] = ticker
     return mapping
+
+
+def _polymarket_assets(record: GameMappingRecord) -> list[str]:
+    details = record.match_details or {}
+    asset_ids = details.get("polymarket_asset_ids") or []
+    assets = [asset_id for asset_id in asset_ids if asset_id]
+    if assets:
+        return assets
+    outcome_map = details.get("polymarket_outcome_map") or {}
+    return [asset_id for asset_id in outcome_map.values() if asset_id]
+
+
+def _sync_gate(
+    record: GameMappingRecord,
+    manager: BookManager,
+    config: Phase5Config,
+    *,
+    now_ts: float,
+) -> str | None:
+    kalshi_tickers = [entry.get("ticker") for entry in record.kalshi_team_markets if entry.get("ticker")]
+    polymarket_assets = _polymarket_assets(record)
+    if not kalshi_tickers or not polymarket_assets:
+        return None
+    kalshi_ts = manager.latest_update_ts("kalshi", kalshi_tickers)
+    poly_ts = manager.latest_update_ts("polymarket", polymarket_assets)
+    if kalshi_ts is None or poly_ts is None:
+        return "sync_missing_ts"
+    fresh_s = config.fresh_ms / 1000.0
+    if now_ts - kalshi_ts > fresh_s:
+        return "stale_kalshi_leg"
+    if now_ts - poly_ts > fresh_s:
+        return "stale_polymarket_leg"
+    if abs(kalshi_ts - poly_ts) * 1000.0 > config.sync_ms:
+        return "sync_window"
+    return None
 
 
 def _estimate_fee(venue: str, fee_per_contract: float) -> float:

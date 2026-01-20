@@ -248,7 +248,7 @@ class PaperStore:
                 vol_10,
                 vol_sum_5,
                 quality_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ticker,

@@ -320,11 +320,21 @@ def _extract_orderbook_levels(payload: dict[str, Any]) -> dict[str, list[tuple[i
     book = payload.get("orderbook") if isinstance(payload, dict) else None
     if isinstance(book, dict):
         payload = book
+    yes_bids = _normalize_levels(payload.get("yes_bids") or payload.get("yes_bid") or payload.get("yes"))
+    no_bids = _normalize_levels(payload.get("no_bids") or payload.get("no_bid") or payload.get("no"))
+    yes_asks = _normalize_levels(payload.get("yes_asks") or payload.get("yes_ask"))
+    no_asks = _normalize_levels(payload.get("no_asks") or payload.get("no_ask"))
+
+    if not yes_asks and no_bids:
+        yes_asks = [(100 - price, size) for price, size in no_bids]
+    if not no_asks and yes_bids:
+        no_asks = [(100 - price, size) for price, size in yes_bids]
+
     keys = {
-        "yes_bids": _normalize_levels(payload.get("yes_bids") or payload.get("yes_bid") or payload.get("yes")),
-        "yes_asks": _normalize_levels(payload.get("yes_asks") or payload.get("yes_ask")),
-        "no_bids": _normalize_levels(payload.get("no_bids") or payload.get("no_bid") or payload.get("no")),
-        "no_asks": _normalize_levels(payload.get("no_asks") or payload.get("no_ask")),
+        "yes_bids": yes_bids,
+        "yes_asks": yes_asks,
+        "no_bids": no_bids,
+        "no_asks": no_asks,
     }
     return keys
 
@@ -383,6 +393,22 @@ def _depth_check(
     if top3_size < 4 * qty:
         return DepthCheck(False, best_level_size, top3_size, best_price, "top3_levels")
     return DepthCheck(True, best_level_size, top3_size, best_price, None)
+
+
+def _top_levels_snapshot(
+    levels: dict[str, list[tuple[int, int]]],
+    side: str,
+    action: str,
+    limit: int = 3,
+) -> list[tuple[int, int]]:
+    side = side.upper()
+    action = action.lower()
+    if side not in {"YES", "NO"}:
+        return []
+    key_prefix = "yes" if side == "YES" else "no"
+    ladder = levels[f"{key_prefix}_{'asks' if action == 'buy' else 'bids'}"]
+    sorted_levels = _best_levels(ladder, "min" if action == "buy" else "max")
+    return sorted_levels[:limit]
 
 
 def _effective_capital(balance: float) -> float:
@@ -719,6 +745,12 @@ def run_loop() -> None:
     engine = SignalEngine(artifacts)
 
     mode = env.get("NBA_ENGINE_MODE", "live").lower()
+    submit_orders = mode == "live" and env.get("KALSHI_SUBMIT_ORDERS", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
     rest_client: RestClient | None = None
     if mode == "live":
         if not config.kalshi_rest_url:
@@ -729,7 +761,11 @@ def run_loop() -> None:
             config.kalshi_private_key_path,
             order_url="https://demo-api.kalshi.co/trade-api/v2",
         )
-        adapter = LiveOrderAdapter(rest_client, ledger)
+        if submit_orders:
+            adapter = LiveOrderAdapter(rest_client, ledger)
+        else:
+            adapter = PaperOrderAdapter(store, ledger)
+            _log_event("orders_disabled", reason="KALSHI_SUBMIT_ORDERS=0")
     else:
         adapter = PaperOrderAdapter(store, ledger)
 
@@ -760,6 +796,12 @@ def run_loop() -> None:
             return None
         payload = rest_client.get_portfolio()
         balance = _extract_balance(payload)
+        override_raw = env.get("KALSHI_BALANCE_OVERRIDE")
+        if override_raw:
+            try:
+                balance = float(override_raw)
+            except ValueError:
+                _log_event("balance_override_invalid", value=override_raw)
         _log_event("portfolio_ok", balance=balance)
         return balance
 
@@ -804,9 +846,9 @@ def run_loop() -> None:
         market_ticker: str,
         side: str,
         action: str,
-    ) -> tuple[int, float | None, DepthCheck, float | None]:
+    ) -> tuple[int, float | None, DepthCheck, float | None, list[tuple[int, int]]]:
         if rest_client is None:
-            return 1, None, DepthCheck(True, 0, 0, None, None), None
+            return 1, None, DepthCheck(True, 0, 0, None, None), None, []
         try:
             book = rest_client.get_orderbook(market_ticker)
         except Exception as exc:
@@ -815,13 +857,13 @@ def run_loop() -> None:
                 market_ticker=market_ticker,
                 error=str(exc),
             )
-            return 0, None, DepthCheck(False, 0, 0, None, "orderbook_error"), None
+            return 0, None, DepthCheck(False, 0, 0, None, "orderbook_error"), None, []
         levels = _extract_orderbook_levels(book)
         best_prices = _derive_best_prices(levels)
         price_key = f"{'yes' if side.upper() == 'YES' else 'no'}_{'ask' if action == 'buy' else 'bid'}"
         best_price_cents = best_prices.get(price_key)
         if best_price_cents is None:
-            return 0, None, DepthCheck(False, 0, 0, None, "missing_price"), None
+            return 0, None, DepthCheck(False, 0, 0, None, "missing_price"), None, []
         best_price = best_price_cents / 100.0
         try:
             balance = _fetch_balance()
@@ -833,16 +875,17 @@ def run_loop() -> None:
             )
             balance = None
         if balance is None:
-            return 0, best_price, DepthCheck(False, 0, 0, best_price, "missing_balance"), None
+            return 0, best_price, DepthCheck(False, 0, 0, best_price, "missing_balance"), None, []
         qty = _size_for_price(balance, best_price)
         if qty <= 0:
-            return 0, best_price, DepthCheck(False, 0, 0, best_price, "size_zero"), balance
+            return 0, best_price, DepthCheck(False, 0, 0, best_price, "size_zero"), balance, []
         depth = _depth_check(levels, side, action, qty, best_prices)
-        return qty, best_price, depth, balance
+        depth_levels = _top_levels_snapshot(levels, side, action)
+        return qty, best_price, depth, balance, depth_levels
 
     def _refresh_pending(now: datetime) -> None:
         nonlocal kill_switch
-        if rest_client is None:
+        if not submit_orders:
             return
         for ticker, pending_order in list(pending_entries.items()):
             status = adapter.get_order_status(pending_order.order_id)
@@ -952,6 +995,7 @@ def run_loop() -> None:
         open_positions=len(positions),
         artifacts=artifacts.summary(),
         mode=mode,
+        submit_orders=submit_orders,
         force_ticker=force_ticker,
         force_direction=force_direction,
     )
@@ -1060,6 +1104,7 @@ def run_loop() -> None:
                     last_prices.get(candle.market_ticker),
                 )
                 if reason and exit_price is not None and pnl is not None:
+                    price = exit_price
                     if rest_client is not None:
                         depth = _fetch_depth(
                             candle.market_ticker, position.side, "sell", position.qty
@@ -1075,81 +1120,66 @@ def run_loop() -> None:
                                 top3_size=depth.top3_size,
                             )
                             continue
-                        price = depth.best_price if depth.best_price is not None else exit_price
-                        order_key = _exit_order_key(position)
-                        result = adapter.submit_exit(
-                            ExitOrder(
-                                order_key=order_key,
-                                position=position,
-                                exit_ts=candle.start_ts,
-                                exit_price=price,
-                                exit_reason=reason,
-                                pnl=_pnl_for_side(
-                                    position.side, position.entry_price, price, position.qty
-                                ),
-                            )
+                        if depth.best_price is not None:
+                            price = depth.best_price
+                    order_key = _exit_order_key(position)
+                    result = adapter.submit_exit(
+                        ExitOrder(
+                            order_key=order_key,
+                            position=position,
+                            exit_ts=candle.start_ts,
+                            exit_price=price,
+                            exit_reason=reason,
+                            pnl=_pnl_for_side(
+                                position.side, position.entry_price, price, position.qty
+                            ),
                         )
-                        if result.accepted and result.order_id is not None:
-                            pending_exits[candle.market_ticker] = PendingOrder(
-                                order_id=result.order_id,
-                                market_ticker=position.market_ticker,
-                                side=position.side,
-                                action="sell",
-                                qty=position.qty,
-                                price=price,
-                                placed_ts=candle.start_ts,
-                                exit_reason=reason,
-                                pnl=_pnl_for_side(
-                                    position.side, position.entry_price, price, position.qty
-                                ),
-                            )
-                            _log_event(
-                                "exit_submitted",
-                                market_ticker=position.market_ticker,
-                                side=position.side,
-                                qty=position.qty,
-                                reason=reason,
-                                exit_ts=candle.start_ts.isoformat(),
-                                exit_price=price,
-                                order_id=result.order_id,
-                            )
-                        else:
-                            _log_event(
-                                "exit_deduped",
-                                market_ticker=position.market_ticker,
-                                order_key=order_key,
-                            )
+                    )
+                    if submit_orders and result.accepted and result.order_id is not None:
+                        pending_exits[candle.market_ticker] = PendingOrder(
+                            order_id=result.order_id,
+                            market_ticker=position.market_ticker,
+                            side=position.side,
+                            action="sell",
+                            qty=position.qty,
+                            price=price,
+                            placed_ts=candle.start_ts,
+                            exit_reason=reason,
+                            pnl=_pnl_for_side(
+                                position.side, position.entry_price, price, position.qty
+                            ),
+                        )
+                        _log_event(
+                            "exit_submitted",
+                            market_ticker=position.market_ticker,
+                            side=position.side,
+                            qty=position.qty,
+                            reason=reason,
+                            exit_ts=candle.start_ts.isoformat(),
+                            exit_price=price,
+                            order_id=result.order_id,
+                        )
+                    elif result.accepted:
+                        positions.pop(candle.market_ticker, None)
+                        _log_event(
+                            "exit",
+                            market_ticker=position.market_ticker,
+                            side=position.side,
+                            reason=reason,
+                            exit_ts=candle.start_ts.isoformat(),
+                            exit_price=price,
+                            pnl=_pnl_for_side(
+                                position.side, position.entry_price, price, position.qty
+                            ),
+                            entry_ts=position.entry_ts.isoformat(),
+                            entry_price=position.entry_price,
+                        )
                     else:
-                        order_key = _exit_order_key(position)
-                        result = adapter.submit_exit(
-                            ExitOrder(
-                                order_key=order_key,
-                                position=position,
-                                exit_ts=candle.start_ts,
-                                exit_price=exit_price,
-                                exit_reason=reason,
-                                pnl=pnl,
-                            )
+                        _log_event(
+                            "exit_deduped",
+                            market_ticker=position.market_ticker,
+                            order_key=order_key,
                         )
-                        if result.accepted:
-                            positions.pop(candle.market_ticker, None)
-                            _log_event(
-                                "exit",
-                                market_ticker=position.market_ticker,
-                                side=position.side,
-                                reason=reason,
-                                exit_ts=candle.start_ts.isoformat(),
-                                exit_price=exit_price,
-                                pnl=pnl,
-                                entry_ts=position.entry_ts.isoformat(),
-                                entry_price=position.entry_price,
-                            )
-                        else:
-                            _log_event(
-                                "exit_deduped",
-                                market_ticker=position.market_ticker,
-                                order_key=order_key,
-                            )
                     if not kill_switch:
                         mean_pnl, sample_count = store.recent_mean_pnl(
                             KILL_SWITCH_SAMPLE, artifacts.quality_cutoff
@@ -1225,7 +1255,7 @@ def run_loop() -> None:
                         entry_price = candle.close
                         balance = None
                         if rest_client is not None:
-                            qty, entry_price, depth, balance = _prepare_order(
+                            qty, entry_price, depth, balance, depth_levels = _prepare_order(
                                 candle.market_ticker,
                                 side,
                                 "buy",
@@ -1241,6 +1271,7 @@ def run_loop() -> None:
                                     top3_size=depth.top3_size,
                                     best_price=depth.best_price,
                                     balance=balance,
+                                    depth_levels=depth_levels,
                                 )
                                 pending.pop(candle.market_ticker, None)
                                 continue
@@ -1309,7 +1340,7 @@ def run_loop() -> None:
                             )
                         )
                         if result.accepted and result.order_id is not None:
-                            if rest_client is not None:
+                            if submit_orders:
                                 pending_entries[candle.market_ticker] = PendingOrder(
                                     order_id=result.order_id,
                                     market_ticker=candle.market_ticker,

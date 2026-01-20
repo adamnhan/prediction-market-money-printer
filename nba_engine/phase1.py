@@ -39,6 +39,7 @@ KALSHI_L2_LOGGING = os.getenv("KALSHI_L2_LOGGING", "1") == "1"
 KALSHI_L2_CHECKPOINT_INTERVAL_S = int(os.getenv("KALSHI_L2_CHECKPOINT_INTERVAL_S", "60"))
 KALSHI_L2_LOG_EVERY_N = int(os.getenv("KALSHI_L2_LOG_EVERY_N", "1000"))
 KALSHI_MARKET_REFRESH_S = int(os.getenv("KALSHI_MARKET_REFRESH_S", "86400"))
+NULL_CANDLE_WARN_AFTER = timedelta(minutes=30)
 
 
 @dataclass
@@ -631,26 +632,30 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
     logged_states = {log_ticker}
     db_path = Path(os.getenv("KALSHI_CANDLE_DB_PATH", "data/phase1_candles.sqlite"))
     store = CandleStore(db_path)
-    l2_recorder = None
-    l2_books: dict[str, dict[str, dict[int, int]]] = {}
-    if KALSHI_L2_LOGGING:
-        l2_recorder = L2Recorder(
-            Path(KALSHI_L2_DB_PATH),
-            KALSHI_L2_CHECKPOINT_INTERVAL_S,
-            KALSHI_L2_LOG_EVERY_N,
-        )
-        logger.info(
-            "l2_logging_enabled db=%s session_id=%s checkpoint_s=%d log_every_n=%d",
-            KALSHI_L2_DB_PATH,
-            l2_recorder.session_id,
-            KALSHI_L2_CHECKPOINT_INTERVAL_S,
-            KALSHI_L2_LOG_EVERY_N,
-        )
     pending_subscribe_ids: dict[int, str] = {}
     market_to_sid: dict[str, int] = {}
     inactive_tickers: set[str] = set()
     active_tickers: set[str] = set()
     total_subscribe_requests = len(tickers)
+    null_streak_start: datetime | None = None
+    last_null_warning_ts: datetime | None = None
+
+    def _track_null_candles(candle: Candle) -> None:
+        nonlocal null_streak_start, last_null_warning_ts
+        now = datetime.now(timezone.utc)
+        if not math.isnan(candle.close):
+            null_streak_start = None
+            last_null_warning_ts = None
+            return
+        if null_streak_start is None:
+            null_streak_start = now
+            return
+        if now - null_streak_start < NULL_CANDLE_WARN_AFTER:
+            return
+        if last_null_warning_ts and now - last_null_warning_ts < NULL_CANDLE_WARN_AFTER:
+            return
+        logger.warning("warning candles closed at null for the past 30 minutes")
+        last_null_warning_ts = now
 
     async def candle_timer() -> None:
         while True:
@@ -664,6 +669,7 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
                         state.p_open if state.p_open is not None else float("nan"),
                         state.p_base if state.p_base is not None else float("nan"),
                     )
+                    _track_null_candles(candle)
                     if state.ticker in logged_states:
                         logger.info(
                             "candle %s start=%s close=%.2f vol=%.2f ret1=%.6f ret3=%.6f ret5=%.6f vol10=%.6f volsum5=%.2f gap=%d active=%d active3=%d gap5=%d p_open=%.2f p_base=%.2f",
@@ -703,14 +709,33 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
     while True:
         pending_subscribe_ids.clear()
         market_to_sid.clear()
+        inactive_tickers.clear()
+        active_tickers.clear()
+        l2_recorder = None
+        l2_books: dict[str, dict[str, dict[int, int]]] = {}
+        if KALSHI_L2_LOGGING:
+            l2_recorder = L2Recorder(
+                Path(KALSHI_L2_DB_PATH),
+                KALSHI_L2_CHECKPOINT_INTERVAL_S,
+                KALSHI_L2_LOG_EVERY_N,
+            )
+            logger.info(
+                "l2_logging_enabled db=%s session_id=%s checkpoint_s=%d log_every_n=%d",
+                KALSHI_L2_DB_PATH,
+                l2_recorder.session_id,
+                KALSHI_L2_CHECKPOINT_INTERVAL_S,
+                KALSHI_L2_LOG_EVERY_N,
+            )
         try:
             headers = build_ws_auth_headers(config, private_key)
+            logger.info("ws_connecting url=%s attempt=%d", config.kalshi_ws_url, attempt + 1)
             async with websockets.connect(
                 config.kalshi_ws_url,
                 additional_headers=headers,
                 ping_interval=20,
                 ping_timeout=20,
             ) as websocket:
+                logger.info("ws_connected url=%s attempt=%d", config.kalshi_ws_url, attempt + 1)
                 sub_id = 1
                 for ticker in tickers:
                     payload = {
@@ -724,6 +749,7 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
                     await websocket.send(json.dumps(payload))
                     pending_subscribe_ids[sub_id] = ticker
                     sub_id += 1
+                logger.info("ws_subscribe_sent count=%d", sub_id - 1)
 
                 async def market_refresh_timer() -> None:
                     nonlocal sub_id, total_subscribe_requests
@@ -842,6 +868,7 @@ async def run_live(series_ticker: str = "KXNBAGAME") -> None:
                             state.p_open if state.p_open is not None else float("nan"),
                             state.p_base if state.p_base is not None else float("nan"),
                         )
+                        _track_null_candles(candle)
                         if state.ticker == log_ticker:
                             logger.info(
                                 "candle %s start=%s close=%.2f vol=%.2f ret1=%.6f ret3=%.6f ret5=%.6f vol10=%.6f volsum5=%.2f gap=%d active=%d active3=%d gap5=%d p_open=%.2f p_base=%.2f",
