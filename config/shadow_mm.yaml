@@ -1,0 +1,36 @@
+# Shadow MM configuration (flat key/value YAML).
+markets_file: config/markets_nba.txt
+log_dir: market_maker/logs
+
+quote_cadence_s: 1
+summary_every_s: 60
+health_every_s: 10
+quote_size: 1
+quote_ttl_s: 10
+mark_price_mode: bid
+
+base_spread_cents: 6
+k_cents_per_contract: 0.05
+itarget: 10
+imax: 25
+
+min_spread_cents: 4
+staleness_s: 2
+vol_move_cents: 3
+vol_window_s: 2
+halt_s: 10
+fee_per_contract_cents: 0
+max_hold_s: 3600
+force_unwind_on_max_hold: false
+stop_loss_cents: 500
+stop_loss_halt_s: 600
+force_unwind_on_stop_loss: false
+
+touch_ms: 600
+p_fill_base: 0.25
+p_fill_spread_bonus_per_cent: 0.03
+p_fill_size_bonus_per_contract: 0.01
+p_fill_vol_penalty_per_cent: 0.05
+top_of_book_tick_cents: 1
+max_fills_per_minute: 20
+max_fills_per_quote_per_s: 1
