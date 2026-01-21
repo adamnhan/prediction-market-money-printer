@@ -209,7 +209,19 @@ class RestClient:
         return self.request("GET", f"/markets/{market_ticker}/orderbook")
 
     def place_order(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/portfolio/orders", body=payload, base_url=self.order_url)
+        response = self.request("POST", "/portfolio/orders", body=payload, base_url=self.order_url)
+        order_id = _extract_order_id(response)
+        _log_event(
+            "order_placed",
+            market_ticker=payload.get("ticker"),
+            side=payload.get("side"),
+            action=payload.get("action"),
+            qty=payload.get("count") or payload.get("qty"),
+            yes_price=payload.get("yes_price"),
+            no_price=payload.get("no_price"),
+            order_id=order_id,
+        )
+        return response
 
     def get_order(self, order_id: int) -> dict[str, Any]:
         return self.request("GET", f"/portfolio/orders/{order_id}", base_url=self.order_url)

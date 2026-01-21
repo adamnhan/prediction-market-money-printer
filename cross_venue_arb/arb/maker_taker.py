@@ -33,8 +33,9 @@ class MakerTakerConfig:
     min_reprice_interval_s: float = 1.0
     reprice_threshold_ticks: int = 1
     allow_reprice_up: bool = False
-    fresh_s: float = 0.25
-    sync_s: float = 0.05
+    fresh_s: float = 1.0
+    sync_s: float = 0.25
+    use_dirty_sync: bool = True
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class GameState:
     active_order: KalshiOrderState | None = None
     last_reprice_ts: float | None = None
     last_intent: QuoteIntent | None = None
+    last_decision_ts: float | None = None
 
 
 class MakerTakerCoordinator:
@@ -84,6 +86,11 @@ class MakerTakerCoordinator:
         self._config = config
         self._max_active_global = max_active_global
         self._states: dict[str, GameState] = {}
+        self._placed_count = 0
+        self._fill_count = 0
+        self._status_counts: dict[str, int] = {}
+        self._counter_window_start = time.monotonic()
+        self._counter_interval_s = 600.0
 
     def step_game(self, record: GameMappingRecord, manager: BookManager) -> list[ShadowTradeRecord]:
         now = time.monotonic()
@@ -93,20 +100,13 @@ class MakerTakerCoordinator:
         if state.active_order is None:
             if self._active_order_count() >= self._max_active_global:
                 return trades
-            intent = _pick_best_intent(record, manager, self._config)
+            intent = _pick_best_intent(record, manager, self._config, state.last_decision_ts)
+            state.last_decision_ts = now
             if intent is None or intent.reason:
                 state.last_intent = intent
                 return trades
             state.active_order = _place_order(intent, now, self._config)
-            logger.info(
-                "quote placed game=%s team=%s price=%.4f size=%.2f edge=%.4f poly_ask=%.4f",
-                intent.game_key,
-                intent.team_to_buy,
-                intent.price,
-                intent.size,
-                intent.edge_per_contract,
-                intent.poly_ask,
-            )
+            self._note_order_placed(now)
             state.status = "QUOTE_PLACED"
             state.last_reprice_ts = now
             state.last_intent = intent
@@ -115,27 +115,20 @@ class MakerTakerCoordinator:
         order = state.active_order
         if now - order.created_ts >= order.ttl_seconds:
             order.status = "EXPIRED"
-            logger.info(
-                "quote expired game=%s team=%s price=%.4f filled=%.2f",
-                order.game_key,
-                order.team_norm,
-                order.price,
-                order.filled_size,
-            )
             state.active_order = None
             state.status = "IDLE"
             return trades
 
-        refreshed = _build_intent_for_order(record, manager, self._config, order)
+        refreshed = _build_intent_for_order(
+            record,
+            manager,
+            self._config,
+            order,
+            last_decision_ts=state.last_decision_ts,
+        )
+        state.last_decision_ts = now
         if refreshed is None or refreshed.reason:
             order.status = "CANCELED"
-            logger.info(
-                "quote canceled game=%s team=%s price=%.4f reason=%s",
-                order.game_key,
-                order.team_norm,
-                order.price,
-                refreshed.reason if refreshed else "no_intent",
-            )
             state.active_order = None
             state.status = "IDLE"
             state.last_intent = refreshed
@@ -144,17 +137,10 @@ class MakerTakerCoordinator:
         state.last_intent = refreshed
         if _should_reprice(order, refreshed, state.last_reprice_ts, now, self._config):
             state.active_order = _place_order(refreshed, now, self._config)
+            self._note_order_placed(now)
             state.last_reprice_ts = now
             state.status = "QUOTE_PLACED"
             order.status = "CANCELED"
-            logger.info(
-                "quote repriced game=%s team=%s old=%.4f new=%.4f edge=%.4f",
-                order.game_key,
-                order.team_norm,
-                order.price,
-                refreshed.price,
-                refreshed.edge_per_contract,
-            )
             return trades
 
         fill_size = _maybe_fill_order(order, manager)
@@ -162,14 +148,6 @@ class MakerTakerCoordinator:
             fill_price = order.price
             order.filled_size += fill_size
             order.avg_fill_price = fill_price
-            logger.info(
-                "fill game=%s team=%s price=%.4f size=%.2f status=%s",
-                order.game_key,
-                order.team_norm,
-                fill_price,
-                fill_size,
-                "FULL" if order.filled_size >= order.size else "PARTIAL",
-            )
             if order.filled_size >= order.size:
                 order.status = "FILLED"
                 state.active_order = None
@@ -179,6 +157,7 @@ class MakerTakerCoordinator:
                 state.status = "HEDGE_PENDING"
             trade = _simulate_hedge(record, order, fill_price, fill_size, now, manager, self._config)
             trades.append(trade)
+            self._note_trade(trade, now)
         return trades
 
     def _active_order_count(self) -> int:
@@ -189,13 +168,40 @@ class MakerTakerCoordinator:
                 count += 1
         return count
 
+    def _note_order_placed(self, now: float) -> None:
+        self._placed_count += 1
+        self._maybe_log_summary(now)
+
+    def _note_trade(self, trade: ShadowTradeRecord, now: float) -> None:
+        self._fill_count += 1
+        status = trade.status.lower()
+        self._status_counts[status] = self._status_counts.get(status, 0) + 1
+        self._maybe_log_summary(now)
+
+    def _maybe_log_summary(self, now: float) -> None:
+        elapsed = now - self._counter_window_start
+        if elapsed < self._counter_interval_s:
+            return
+        logger.info(
+            "orders_placed count=%d fills=%d status=%s window_s=%d",
+            self._placed_count,
+            self._fill_count,
+            ",".join(f"{k}:{v}" for k, v in sorted(self._status_counts.items())) or "none",
+            int(elapsed),
+        )
+        self._placed_count = 0
+        self._fill_count = 0
+        self._status_counts = {}
+        self._counter_window_start = now
+
 
 def _pick_best_intent(
     record: GameMappingRecord,
     manager: BookManager,
     config: MakerTakerConfig,
+    last_decision_ts: float | None,
 ) -> QuoteIntent | None:
-    intents = build_quote_intents(record, manager, config)
+    intents = build_quote_intents(record, manager, config, last_decision_ts)
     candidates = [intent for intent in intents if intent.reason is None]
     if not candidates:
         return intents[0] if intents else None
@@ -206,6 +212,7 @@ def build_quote_intents(
     record: GameMappingRecord,
     manager: BookManager,
     config: MakerTakerConfig,
+    last_decision_ts: float | None,
 ) -> list[QuoteIntent]:
     team_map = _kalshi_team_map(record.kalshi_team_markets)
     if len(team_map) < 2:
@@ -226,6 +233,7 @@ def build_quote_intents(
             team_to_buy=team_a,
             hedge_team=team_b,
             poly_asset_id=poly_asset_b,
+            last_decision_ts=last_decision_ts,
         )
     )
     intents.append(
@@ -236,6 +244,7 @@ def build_quote_intents(
             team_to_buy=team_b,
             hedge_team=team_a,
             poly_asset_id=poly_asset_a,
+            last_decision_ts=last_decision_ts,
         )
     )
     return intents
@@ -249,6 +258,7 @@ def _build_intent(
     team_to_buy: str,
     hedge_team: str,
     poly_asset_id: str | None,
+    last_decision_ts: float | None,
 ) -> QuoteIntent:
     kalshi_ticker = _kalshi_team_map(record.kalshi_team_markets).get(team_to_buy)
     if not kalshi_ticker:
@@ -310,7 +320,7 @@ def _build_intent(
             "missing_book",
         )
 
-    if not _books_synced(book_kalshi, book_poly, time.monotonic(), config):
+    if not _books_synced(book_kalshi, book_poly, time.monotonic(), config, last_decision_ts):
         return QuoteIntent(
             record.game_key,
             team_to_buy,
@@ -419,6 +429,8 @@ def _build_intent_for_order(
     manager: BookManager,
     config: MakerTakerConfig,
     order: KalshiOrderState,
+    *,
+    last_decision_ts: float | None,
 ) -> QuoteIntent | None:
     return _build_intent(
         record,
@@ -427,6 +439,7 @@ def _build_intent_for_order(
         team_to_buy=order.team_norm,
         hedge_team=order.hedge_team,
         poly_asset_id=order.poly_asset_id,
+        last_decision_ts=last_decision_ts,
     )
 
 
@@ -521,20 +534,6 @@ def _simulate_hedge(
         if realized_edge < 0:
             reason_parts.append("adverse_selection")
         status = "HEDGED" if hedge_size == fill_size else "PARTIAL_HEDGE"
-    logger.info(
-        "hedge %s game=%s team=%s hedge_team=%s kalshi=%.4f poly=%.4f size=%.2f edge=%s pnl=%s reason=%s",
-        status.lower(),
-        record.game_key,
-        order.team_norm,
-        order.hedge_team,
-        fill_price,
-        hedge_price or 0.0,
-        hedge_size,
-        f"{realized_edge:.4f}" if realized_edge is not None else "n/a",
-        f"{realized_pnl:.4f}" if realized_pnl is not None else "n/a",
-        reason,
-    )
-
     latency_ms = int((now - order.created_ts) * 1000)
     reason = ",".join(sorted(set(reason_parts))) if reason_parts else None
     legs = [
@@ -585,7 +584,13 @@ def _kalshi_team_map(team_markets: list[dict]) -> dict[str, str]:
     return mapping
 
 
-def _books_synced(book_a: object, book_b: object, now: float, config: MakerTakerConfig) -> bool:
+def _books_synced(
+    book_a: object,
+    book_b: object,
+    now: float,
+    config: MakerTakerConfig,
+    last_decision_ts: float | None,
+) -> bool:
     ts_a = getattr(book_a, "last_update_ts", None)
     ts_b = getattr(book_b, "last_update_ts", None)
     if ts_a is None or ts_b is None:
@@ -594,7 +599,11 @@ def _books_synced(book_a: object, book_b: object, now: float, config: MakerTaker
         return False
     if now - ts_b > config.fresh_s:
         return False
-    if abs(ts_a - ts_b) > config.sync_s:
+    if config.use_dirty_sync:
+        if last_decision_ts is None:
+            return True
+        return ts_a > last_decision_ts and ts_b > last_decision_ts
+    if config.sync_s > 0 and abs(ts_a - ts_b) > config.sync_s:
         return False
     return True
 

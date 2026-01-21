@@ -1658,7 +1658,7 @@ def _dashboard_html() -> str:
           "Last update: " + (data.last_update ? ts(data.last_update) : "--");
       }
       loadDashboard();
-      setInterval(loadDashboard, 4000);
+      setInterval(loadDashboard, 30000);
     </script>
   </body>
 </html>

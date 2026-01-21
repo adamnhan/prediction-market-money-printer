@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 import os
 import asyncio
 import httpx
+import logging
 
 
 KALSHI_BASE_URL = "https://api.kalshi.com/trade-api/v2"
@@ -31,6 +32,14 @@ GET_PORTFOLIO = f"{KALSHI_BASE_URL}/portfolio"
 
 # --- misc ---
 DEFAULT_TIMEOUT = 20
+
+
+logger = logging.getLogger("platform_ops")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[PLATFORM_OPS] %(asctime)s %(message)s"))
+    logger.addHandler(handler)
 
 
 def _build_headers(api_key: Optional[str] = None, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -64,6 +73,41 @@ async def _request(method: str, url: str, params: Optional[Dict[str, Any]] = Non
         return {"ok": False, "status": status, "error": err_msg}
     except httpx.RequestError as e:
         return {"ok": False, "status": None, "error": str(e)}
+
+
+def _extract_order_id(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("order_id", "id"):
+        value = payload.get(key)
+        if value is not None:
+            return str(value)
+    order = payload.get("order")
+    if isinstance(order, dict):
+        value = order.get("order_id") or order.get("id")
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _parse_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_fill_status(payload: Any) -> tuple[Optional[str], int, int]:
+    if not isinstance(payload, dict):
+        return None, 0, 0
+    order = payload.get("order") if isinstance(payload.get("order"), dict) else payload
+    status = order.get("status") or order.get("state")
+    filled = _parse_int(order.get("filled_count") or order.get("filled_qty") or 0) or 0
+    remaining = _parse_int(order.get("remaining_count") or order.get("remaining_qty"))
+    if remaining is None:
+        count = _parse_int(order.get("count") or order.get("qty"))
+        remaining = max(count - filled, 0) if count is not None else 0
+    return str(status).lower() if status is not None else None, filled, remaining
 
 
 # --- wrapper helpers ---
@@ -105,7 +149,29 @@ async def get_market_trades(market_ticker: str, limit: int = 100, offset: int = 
 
 # --- trading helpers ---
 async def place_order(order_payload: Dict[str, Any], api_key: Optional[str] = None) -> Dict[str, Any]:
-    return await _request("POST", PLACE_ORDER, json=order_payload, api_key=api_key)
+    response = await _request("POST", PLACE_ORDER, json=order_payload, api_key=api_key)
+    order_id = _extract_order_id(response.get("data"))
+    if response.get("ok"):
+        logger.info(
+            "order_placed ticker=%s action=%s side=%s qty=%s yes_price=%s no_price=%s order_id=%s",
+            order_payload.get("ticker"),
+            order_payload.get("action"),
+            order_payload.get("side"),
+            order_payload.get("count") or order_payload.get("qty"),
+            order_payload.get("yes_price"),
+            order_payload.get("no_price"),
+            order_id,
+        )
+    else:
+        logger.info(
+            "order_place_failed ticker=%s action=%s side=%s qty=%s error=%s",
+            order_payload.get("ticker"),
+            order_payload.get("action"),
+            order_payload.get("side"),
+            order_payload.get("count") or order_payload.get("qty"),
+            response.get("error"),
+        )
+    return response
 
 
 async def cancel_order(order_id: str, api_key: Optional[str] = None) -> Dict[str, Any]:
@@ -113,7 +179,18 @@ async def cancel_order(order_id: str, api_key: Optional[str] = None) -> Dict[str
 
 
 async def get_order_status(order_id: str, api_key: Optional[str] = None) -> Dict[str, Any]:
-    return await _request("GET", GET_ORDER_STATUS(order_id), api_key=api_key)
+    response = await _request("GET", GET_ORDER_STATUS(order_id), api_key=api_key)
+    if response.get("ok"):
+        status, filled, remaining = _extract_fill_status(response.get("data"))
+        if status == "filled" or (filled > 0 and remaining == 0):
+            logger.info(
+                "order_filled order_id=%s status=%s filled=%s remaining=%s",
+                order_id,
+                status,
+                filled,
+                remaining,
+            )
+    return response
 
 
 async def get_positions(api_key: Optional[str] = None) -> Dict[str, Any]:
