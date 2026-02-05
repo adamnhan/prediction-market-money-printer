@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import logging
 import os
 import random
@@ -29,12 +30,13 @@ from .phase4 import (
     COOLDOWN,
     ENTRY_DELAY,
     KILL_SWITCH_SAMPLE,
+    MAX_HOLD,
     MemoryPaperStore,
     PaperStore,
     PanicState,
     Position,
     SignalEngine,
-    _exit_signal,
+    _exit_decision,
     _seed_activity,
     _seed_last_prices,
 )
@@ -53,8 +55,15 @@ RISK_PCT = 0.0025
 MAX_NOTIONAL_PCT = 0.05
 OVERRIDE_CAP_PCT = 0.20
 CANCEL_AFTER = timedelta(seconds=60)
+WATCHDOG_INTERVAL_S = int(os.getenv("KALSHI_WATCHDOG_INTERVAL_S", "20"))
+STALE_FEED_S = int(os.getenv("KALSHI_STALE_FEED_S", "120"))
+STATUS_POLL_S = int(os.getenv("KALSHI_STATUS_POLL_S", "60"))
+MARKET_META_POLL_S = int(os.getenv("KALSHI_MARKET_META_POLL_S", "60"))
+MARKET_CUTOFF_MIN = int(os.getenv("KALSHI_MARKET_CUTOFF_MIN", "15"))
 KALSHI_DIAG_INTERVAL_S = int(os.getenv("KALSHI_DIAG_INTERVAL_S", "1800"))
 KALSHI_DIAG_MARKET_SAMPLE = int(os.getenv("KALSHI_DIAG_MARKET_SAMPLE", "5"))
+KALSHI_KILL_SWITCH_WINDOW_H = float(os.getenv("KALSHI_KILL_SWITCH_WINDOW_H", "6"))
+EXIT_PNL_EPS = float(os.getenv("KALSHI_EXIT_PNL_EPS", "1e-6"))
 
 
 @dataclass(frozen=True)
@@ -163,7 +172,11 @@ class RestClient:
         body_str = body_str or ""
         base_path = urlparse(base_url).path.rstrip("/")
         if os.getenv("KALSHI_SIGN_NO_BASE") == "1":
-            base_path = ""
+            logger.warning(
+                "kalshi_sign_no_base_ignored base_path=%s path=%s",
+                base_path,
+                path,
+            )
         full_path = f"{base_path}/{path.lstrip('/')}" if base_path else path
         message = f"{timestamp}{method.upper()}{full_path}"
         if os.getenv("KALSHI_DEBUG_SIGNATURE") == "1":
@@ -208,6 +221,9 @@ class RestClient:
     def get_orderbook(self, market_ticker: str) -> dict[str, Any]:
         return self.request("GET", f"/markets/{market_ticker}/orderbook")
 
+    def get_market(self, market_ticker: str) -> dict[str, Any]:
+        return self.request("GET", f"/markets/{market_ticker}")
+
     def place_order(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self.request("POST", "/portfolio/orders", body=payload, base_url=self.order_url)
         order_id = _extract_order_id(response)
@@ -223,10 +239,10 @@ class RestClient:
         )
         return response
 
-    def get_order(self, order_id: int) -> dict[str, Any]:
+    def get_order(self, order_id: str | int) -> dict[str, Any]:
         return self.request("GET", f"/portfolio/orders/{order_id}", base_url=self.order_url)
 
-    def cancel_order(self, order_id: int) -> dict[str, Any]:
+    def cancel_order(self, order_id: str | int) -> dict[str, Any]:
         return self.request("DELETE", f"/portfolio/orders/{order_id}", base_url=self.order_url)
 
     def cancel_orders(self, order_ids: list[str]) -> dict[str, Any]:
@@ -447,6 +463,155 @@ def _pnl_for_side(side: str, entry_price: float, exit_price: float, qty: int) ->
     if side.upper() == "YES":
         return (exit_price - entry_price) * qty
     return (entry_price - exit_price) * qty
+
+
+def _direction_for_side(side: str) -> str:
+    return "long" if side.upper() == "YES" else "short"
+
+
+def _pnl_formula_for_side(side: str) -> str:
+    if side.upper() == "YES":
+        return "YES: (exit_price - entry_price) * qty"
+    return "NO: (entry_price - exit_price) * qty"
+
+
+def _guard_exit_reason(
+    reason: str,
+    pnl: float | None,
+    take_profit: float,
+    stop_loss: float,
+    eps: float,
+) -> tuple[str, bool, str | None]:
+    if reason not in {"tp", "sl"}:
+        return reason, False, None
+    if pnl is None or math.isnan(pnl):
+        return reason, False, None
+    if pnl >= take_profit - eps:
+        expected = "tp"
+    elif pnl <= stop_loss + eps:
+        expected = "sl"
+    else:
+        expected = "none"
+    if reason != expected:
+        return "reason_mismatch", True, expected
+    return reason, False, expected
+
+
+def _log_exit_decision(
+    *,
+    position: Position,
+    decision_reason: str,
+    decision_price: float,
+    decision_pnl: float,
+    decision_price_source: str,
+    fired_condition: str | None,
+    take_profit: float | None,
+    stop_loss: float | None,
+    max_hold_s: float | None,
+    pnl_formula: str,
+    exit_ts: datetime,
+    order_price: float | None = None,
+    order_pnl: float | None = None,
+) -> None:
+    _log_event(
+        "exit_decision",
+        market_ticker=position.market_ticker,
+        side=position.side,
+        direction=_direction_for_side(position.side),
+        entry_ts=position.entry_ts.isoformat(),
+        entry_price=position.entry_price,
+        exit_ts=exit_ts.isoformat(),
+        exit_price=decision_price,
+        exit_price_source=decision_price_source,
+        exit_price_order=order_price,
+        pnl=decision_pnl,
+        pnl_order=order_pnl,
+        pnl_formula=pnl_formula,
+        take_profit=take_profit,
+        stop_loss=stop_loss,
+        max_hold_s=max_hold_s,
+        fired_condition=fired_condition,
+        reason=decision_reason,
+    )
+
+
+def _extract_market_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    market = payload.get("market")
+    if isinstance(market, dict):
+        return market
+    return payload
+
+
+def _parse_iso_ts(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _extract_market_close_ts(market: dict[str, Any]) -> datetime | None:
+    for key in ("close_time", "close_ts", "closeTime", "close_datetime"):
+        close_raw = market.get(key)
+        close_ts = _parse_iso_ts(close_raw)
+        if close_ts is not None:
+            return close_ts
+    return None
+
+
+def _market_tradable_state(market: dict[str, Any]) -> tuple[bool | None, str | None]:
+    status_raw = market.get("status") or market.get("market_status") or market.get("state")
+    status = str(status_raw).lower() if status_raw is not None else None
+    can_trade = market.get("can_trade")
+    active = market.get("active")
+    closed = market.get("closed")
+    if isinstance(can_trade, bool):
+        return (can_trade, status)
+    if isinstance(closed, bool) and closed:
+        return (False, status)
+    if isinstance(active, bool) and not active:
+        return (False, status)
+    if status in {
+        "open",
+        "active",
+        "trading",
+        "live",
+    }:
+        return (True, status)
+    if status in {
+        "closed",
+        "settled",
+        "resolved",
+        "finalized",
+        "determined",
+        "suspended",
+        "halted",
+        "paused",
+        "expired",
+        "canceled",
+        "inactive",
+    }:
+        return (False, status)
+    return (None, status)
+
+
+@dataclass(frozen=True)
+class MarketMeta:
+    market_ticker: str
+    status: str | None
+    tradable: bool | None
+    close_ts: datetime | None
+    cutoff_ts: datetime | None
+    fetched_ts: datetime
 @dataclass(frozen=True)
 class DepthCheck:
     ok: bool
@@ -458,7 +623,7 @@ class DepthCheck:
 
 @dataclass
 class PendingOrder:
-    order_id: int
+    order_id: int | str
     market_ticker: str
     side: str
     action: str
@@ -496,7 +661,7 @@ class ExitOrder:
 @dataclass(frozen=True)
 class OrderResult:
     accepted: bool
-    order_id: int | None
+    order_id: int | str | None
     reason: str | None
 
 
@@ -515,10 +680,10 @@ class OrderAdapter(Protocol):
     def submit_exit(self, order: ExitOrder) -> OrderResult:
         ...
 
-    def get_order_status(self, order_id: int) -> OrderStatus:
+    def get_order_status(self, order_id: str | int) -> OrderStatus:
         ...
 
-    def cancel_order(self, order_id: int) -> None:
+    def cancel_order(self, order_id: str | int) -> None:
         ...
 
     def cancel_orders(self, order_ids: list[str]) -> None:
@@ -556,10 +721,10 @@ class PaperOrderAdapter:
         )
         return OrderResult(True, order.position.id, None)
 
-    def get_order_status(self, order_id: int) -> OrderStatus:
+    def get_order_status(self, order_id: str | int) -> OrderStatus:
         return OrderStatus(status="filled", filled_qty=1, remaining_qty=0, avg_price=None)
 
-    def cancel_order(self, order_id: int) -> None:
+    def cancel_order(self, order_id: str | int) -> None:
         return None
 
     def cancel_orders(self, order_ids: list[str]) -> None:
@@ -617,11 +782,11 @@ class LiveOrderAdapter:
             return OrderResult(False, None, "missing_order_id")
         return OrderResult(True, order_id, None)
 
-    def get_order_status(self, order_id: int) -> OrderStatus:
+    def get_order_status(self, order_id: str | int) -> OrderStatus:
         payload = self.client.get_order(order_id)
         return _parse_order_status(payload)
 
-    def cancel_order(self, order_id: int) -> None:
+    def cancel_order(self, order_id: str | int) -> None:
         self.client.cancel_order(order_id)
 
     def cancel_orders(self, order_ids: list[str]) -> None:
@@ -661,22 +826,18 @@ def _build_order_payload(
     return payload
 
 
-def _extract_order_id(response: dict[str, Any]) -> int | None:
+def _extract_order_id(response: dict[str, Any]) -> str | None:
     if not isinstance(response, dict):
         return None
     for key in ("order_id", "id"):
         if key in response and response[key] is not None:
-            try:
-                return int(response[key])
-            except (TypeError, ValueError):
-                return None
+            return str(response[key])
     order = response.get("order")
     if isinstance(order, dict):
         value = order.get("order_id") or order.get("id")
-        try:
-            return int(value)
-        except (TypeError, ValueError):
+        if value is None:
             return None
+        return str(value)
     return None
 
 
@@ -715,6 +876,24 @@ def _log_event(event: str, **fields: Any) -> None:
     payload = {"event": event, "ts": datetime.now(timezone.utc).isoformat()}
     payload.update(fields)
     logger.info(json.dumps(payload, sort_keys=True))
+
+
+def _normalize_failed_reasons(reasons: list[str]) -> list[str]:
+    mapped: set[str] = set()
+    for reason in reasons:
+        if reason in ("missing_vol_10", "missing_vol_sum_5"):
+            mapped.add("vol")
+        elif reason == "move_from_base":
+            mapped.add("move")
+        elif reason == "quality_score":
+            mapped.add("quality")
+        elif reason == "cooldown":
+            mapped.add("cooldown")
+        elif reason == "active_last_3":
+            mapped.add("confidence")
+        elif reason == "gap_recent_5":
+            mapped.add("gap")
+    return sorted(mapped)
 
 
 def entry_decision(
@@ -792,9 +971,17 @@ def run_loop() -> None:
     last_panic_ts: dict[str, datetime] = {}
     last_entry_ts: dict[str, datetime] = {}
     last_skip_reason: dict[str, str] = {}
+    last_status_poll_ts: dict[str, datetime] = {}
+    market_meta_cache: dict[str, MarketMeta] = {}
     interval_skip_counts: Counter[str] = Counter()
     last_diag_ts = time.time()
-    mean_pnl, sample_count = store.recent_mean_pnl(KILL_SWITCH_SAMPLE, artifacts.quality_cutoff)
+    last_watchdog_ts = time.time()
+    kill_switch_window_h = KALSHI_KILL_SWITCH_WINDOW_H if KALSHI_KILL_SWITCH_WINDOW_H > 0 else None
+    mean_pnl, sample_count = store.recent_mean_pnl(
+        KILL_SWITCH_SAMPLE,
+        artifacts.quality_cutoff,
+        since_hours=kill_switch_window_h,
+    )
     if sample_count == KILL_SWITCH_SAMPLE and mean_pnl is not None and mean_pnl < 0:
         kill_switch = True
         _log_event("kill_switch_triggered", mean_pnl=mean_pnl, sample=sample_count)
@@ -853,6 +1040,209 @@ def run_loop() -> None:
             depth_reason=depth.reason,
         )
         return depth
+
+    def _fetch_market_meta(market_ticker: str, now: datetime) -> MarketMeta | None:
+        if rest_client is None:
+            return None
+        cached = market_meta_cache.get(market_ticker)
+        if cached and (now - cached.fetched_ts).total_seconds() < MARKET_META_POLL_S:
+            return cached
+        try:
+            payload = rest_client.get_market(market_ticker)
+        except Exception as exc:
+            _log_event(
+                "market_status_error",
+                market_ticker=market_ticker,
+                error=str(exc),
+            )
+            return cached
+        market = _extract_market_payload(payload)
+        tradable, status = _market_tradable_state(market)
+        close_ts = _extract_market_close_ts(market)
+        cutoff_ts = (
+            close_ts - timedelta(minutes=MARKET_CUTOFF_MIN) if close_ts is not None else None
+        )
+        meta = MarketMeta(
+            market_ticker=market_ticker,
+            status=status,
+            tradable=tradable,
+            close_ts=close_ts,
+            cutoff_ts=cutoff_ts,
+            fetched_ts=now,
+        )
+        market_meta_cache[market_ticker] = meta
+        _log_event(
+            "market_status_ok",
+            market_ticker=market_ticker,
+            status=status,
+            tradable=tradable,
+            close_ts=close_ts.isoformat() if close_ts is not None else None,
+            cutoff_ts=cutoff_ts.isoformat() if cutoff_ts is not None else None,
+        )
+        return meta
+
+    def _market_inhibit_reasons(meta: MarketMeta | None, now: datetime) -> list[str]:
+        if meta is None:
+            return []
+        reasons: list[str] = []
+        if meta.status is not None and meta.status not in {"open", "active", "trading", "live"}:
+            reasons.append("status_not_open")
+        elif meta.tradable is False:
+            reasons.append("market_not_tradable")
+        if meta.cutoff_ts is not None and now >= meta.cutoff_ts:
+            reasons.append("cutoff_window")
+        return reasons
+
+    def _cancel_pending_for_market(market_ticker: str, reasons: list[str], now: datetime) -> None:
+        if not submit_orders:
+            pending_entries.pop(market_ticker, None)
+            pending_exits.pop(market_ticker, None)
+            return
+        pending_entry = pending_entries.pop(market_ticker, None)
+        if pending_entry is not None:
+            adapter.cancel_order(pending_entry.order_id)
+            _log_event(
+                "entry_canceled",
+                market_ticker=market_ticker,
+                order_id=pending_entry.order_id,
+                reasons=",".join(reasons),
+                canceled_ts=now.isoformat(),
+                source="cutoff",
+            )
+        pending_exit = pending_exits.pop(market_ticker, None)
+        if pending_exit is not None:
+            adapter.cancel_order(pending_exit.order_id)
+            _log_event(
+                "exit_canceled",
+                market_ticker=market_ticker,
+                order_id=pending_exit.order_id,
+                reasons=",".join(reasons),
+                canceled_ts=now.isoformat(),
+                source="cutoff",
+            )
+
+    def _market_blocked(market_ticker: str, now: datetime) -> list[str]:
+        meta = _fetch_market_meta(market_ticker, now)
+        reasons = _market_inhibit_reasons(meta, now)
+        if reasons:
+            _cancel_pending_for_market(market_ticker, reasons, now)
+        return reasons
+
+    def _submit_exit(
+        *,
+        position: Position,
+        reason: str,
+        now: datetime,
+        fallback_price: float | None,
+        depth_check: bool = False,
+    ) -> None:
+        nonlocal kill_switch
+        if position.market_ticker in pending_exits:
+            return
+        price = fallback_price if fallback_price is not None else position.entry_price
+        price_source = "fallback_price" if fallback_price is not None else "entry_price"
+        if rest_client is not None:
+            depth = _fetch_depth(position.market_ticker, position.side, "sell", position.qty)
+            if depth.best_price is not None:
+                price = depth.best_price
+                price_source = "depth_best_price"
+            if depth_check and not depth.ok:
+                _log_event(
+                    "watchdog_exit_depth",
+                    market_ticker=position.market_ticker,
+                    side=position.side,
+                    qty=position.qty,
+                    reason=reason,
+                    depth_reason=depth.reason,
+                    best_size=depth.best_size,
+                    top3_size=depth.top3_size,
+                    best_price=depth.best_price,
+                )
+                return
+        order_pnl = _pnl_for_side(position.side, position.entry_price, price, position.qty)
+        _log_exit_decision(
+            position=position,
+            decision_reason=reason,
+            decision_price=price,
+            decision_pnl=order_pnl,
+            decision_price_source=price_source,
+            fired_condition=reason,
+            take_profit=None,
+            stop_loss=None,
+            max_hold_s=MAX_HOLD.total_seconds(),
+            pnl_formula=_pnl_formula_for_side(position.side),
+            exit_ts=now,
+            order_price=price,
+            order_pnl=order_pnl,
+        )
+        order_key = _exit_order_key(position)
+        result = adapter.submit_exit(
+            ExitOrder(
+                order_key=order_key,
+                position=position,
+                exit_ts=now,
+                exit_price=price,
+                exit_reason=reason,
+                pnl=order_pnl,
+            )
+        )
+        if submit_orders and result.accepted and result.order_id is not None:
+            pending_exits[position.market_ticker] = PendingOrder(
+                order_id=result.order_id,
+                market_ticker=position.market_ticker,
+                side=position.side,
+                action="sell",
+                qty=position.qty,
+                price=price,
+                placed_ts=now,
+                exit_reason=reason,
+                pnl=order_pnl,
+            )
+            _log_event(
+                "exit_submitted",
+                market_ticker=position.market_ticker,
+                side=position.side,
+                qty=position.qty,
+                reason=reason,
+                exit_ts=now.isoformat(),
+                exit_price=price,
+                order_id=result.order_id,
+                source="watchdog",
+            )
+        elif result.accepted:
+            positions.pop(position.market_ticker, None)
+            _log_event(
+                "exit",
+                market_ticker=position.market_ticker,
+                side=position.side,
+                reason=reason,
+                exit_ts=now.isoformat(),
+                exit_price=price,
+                pnl=order_pnl,
+                entry_ts=position.entry_ts.isoformat(),
+                entry_price=position.entry_price,
+                source="watchdog",
+            )
+        else:
+            _log_event(
+                "exit_deduped",
+                market_ticker=position.market_ticker,
+                order_key=order_key,
+                source="watchdog",
+            )
+        if not kill_switch:
+            mean_pnl, sample_count = store.recent_mean_pnl(
+                KILL_SWITCH_SAMPLE,
+                artifacts.quality_cutoff,
+                since_hours=kill_switch_window_h,
+            )
+            if sample_count == KILL_SWITCH_SAMPLE and mean_pnl is not None and mean_pnl < 0:
+                kill_switch = True
+                _log_event(
+                    "kill_switch_triggered",
+                    mean_pnl=mean_pnl,
+                    sample=sample_count,
+                )
 
     def _prepare_order(
         market_ticker: str,
@@ -975,7 +1365,9 @@ def run_loop() -> None:
                 )
                 if not kill_switch:
                     mean_pnl, sample_count = store.recent_mean_pnl(
-                        KILL_SWITCH_SAMPLE, artifacts.quality_cutoff
+                        KILL_SWITCH_SAMPLE,
+                        artifacts.quality_cutoff,
+                        since_hours=kill_switch_window_h,
                     )
                     if (
                         sample_count == KILL_SWITCH_SAMPLE
@@ -1091,7 +1483,77 @@ def run_loop() -> None:
         interval_skip_counts = Counter()
         last_diag_ts = now_ts
 
+    def _watchdog(now: datetime) -> None:
+        _refresh_pending(now)
+        if rest_client is not None:
+            for ticker in set(pending_entries) | set(pending_exits):
+                reasons = _market_blocked(ticker, now)
+                if reasons:
+                    _log_event(
+                        "watchdog_pending_blocked",
+                        market_ticker=ticker,
+                        reasons=",".join(reasons),
+                        now_ts=now.isoformat(),
+                    )
+        if not positions:
+            return
+        for position in list(positions.values()):
+            if position.market_ticker in pending_exits:
+                continue
+            if now >= position.entry_ts + MAX_HOLD:
+                _log_event(
+                    "watchdog_triggered",
+                    market_ticker=position.market_ticker,
+                    reason="max_hold",
+                    entry_ts=position.entry_ts.isoformat(),
+                    now_ts=now.isoformat(),
+                )
+                _submit_exit(
+                    position=position,
+                    reason="max_hold",
+                    now=now,
+                    fallback_price=last_prices.get(position.market_ticker),
+                )
+                continue
+            last_seen = last_candle_ts.get(position.market_ticker, position.entry_ts)
+            age_s = max((now - last_seen).total_seconds(), 0.0)
+            if age_s >= STALE_FEED_S:
+                _log_event(
+                    "watchdog_stale_feed",
+                    market_ticker=position.market_ticker,
+                    age_s=age_s,
+                    last_seen_ts=last_seen.isoformat(),
+                    now_ts=now.isoformat(),
+                )
+                _submit_exit(
+                    position=position,
+                    reason="stale_feed",
+                    now=now,
+                    fallback_price=last_prices.get(position.market_ticker),
+                )
+                continue
+            if rest_client is None:
+                continue
+            last_status = last_status_poll_ts.get(position.market_ticker)
+            if last_status and (now - last_status).total_seconds() < STATUS_POLL_S:
+                continue
+            last_status_poll_ts[position.market_ticker] = now
+            reasons = _market_blocked(position.market_ticker, now)
+            if reasons:
+                _log_event(
+                    "watchdog_market_blocked",
+                    market_ticker=position.market_ticker,
+                    reasons=",".join(reasons),
+                    now_ts=now.isoformat(),
+                )
+                continue
+
     while True:
+        now = datetime.now(timezone.utc)
+        now_ts = time.time()
+        if WATCHDOG_INTERVAL_S > 0 and now_ts - last_watchdog_ts >= WATCHDOG_INTERVAL_S:
+            _watchdog(now)
+            last_watchdog_ts = now_ts
         rows = stream.fetch_since(last_rowid)
         if not rows:
             time.sleep(1)
@@ -1104,19 +1566,31 @@ def run_loop() -> None:
             if candle.close == candle.close:
                 last_prices[candle.market_ticker] = candle.close
             _log_diag(time.time())
+            blocked_reasons = _market_blocked(candle.market_ticker, datetime.now(timezone.utc))
+            if blocked_reasons:
+                _record_skip(candle.market_ticker, blocked_reasons)
+                _log_event(
+                    "market_inhibit",
+                    market_ticker=candle.market_ticker,
+                    reasons=",".join(blocked_reasons),
+                    ts=candle.start_ts.isoformat(),
+                )
+                pending.pop(candle.market_ticker, None)
+                continue
 
             position = positions.get(candle.market_ticker)
             if position:
                 if candle.market_ticker in pending_exits:
                     continue
-                reason, exit_price, pnl = _exit_signal(
+                decision = _exit_decision(
                     position,
                     candle.start_ts,
                     candle.close,
                     last_prices.get(candle.market_ticker),
                 )
-                if reason and exit_price is not None and pnl is not None:
-                    price = exit_price
+                if decision.reason and decision.exit_price is not None and decision.pnl is not None:
+                    pnl_formula = _pnl_formula_for_side(position.side)
+                    price = decision.exit_price
                     if rest_client is not None:
                         depth = _fetch_depth(
                             candle.market_ticker, position.side, "sell", position.qty
@@ -1134,6 +1608,48 @@ def run_loop() -> None:
                             continue
                         if depth.best_price is not None:
                             price = depth.best_price
+                    order_pnl = _pnl_for_side(
+                        position.side, position.entry_price, price, position.qty
+                    )
+                    reason, mismatch, expected = _guard_exit_reason(
+                        decision.reason,
+                        order_pnl,
+                        decision.take_profit,
+                        decision.stop_loss,
+                        EXIT_PNL_EPS,
+                    )
+                    _log_exit_decision(
+                        position=position,
+                        decision_reason=decision.reason,
+                        decision_price=decision.exit_price,
+                        decision_pnl=decision.pnl,
+                        decision_price_source=decision.price_source,
+                        fired_condition=decision.fired_condition,
+                        take_profit=decision.take_profit,
+                        stop_loss=decision.stop_loss,
+                        max_hold_s=decision.max_hold_seconds,
+                        pnl_formula=pnl_formula,
+                        exit_ts=candle.start_ts,
+                        order_price=price,
+                        order_pnl=order_pnl,
+                    )
+                    if mismatch:
+                        _log_event(
+                            "exit_reason_mismatch",
+                            market_ticker=position.market_ticker,
+                            side=position.side,
+                            direction=_direction_for_side(position.side),
+                            original_reason=decision.reason,
+                            expected_reason=expected,
+                            pnl=order_pnl,
+                            pnl_formula=pnl_formula,
+                            take_profit=decision.take_profit,
+                            stop_loss=decision.stop_loss,
+                            fired_condition=decision.fired_condition,
+                            exit_price_decision=decision.exit_price,
+                            exit_price_order=price,
+                            pnl_decision=decision.pnl,
+                        )
                     order_key = _exit_order_key(position)
                     result = adapter.submit_exit(
                         ExitOrder(
@@ -1142,9 +1658,7 @@ def run_loop() -> None:
                             exit_ts=candle.start_ts,
                             exit_price=price,
                             exit_reason=reason,
-                            pnl=_pnl_for_side(
-                                position.side, position.entry_price, price, position.qty
-                            ),
+                            pnl=order_pnl,
                         )
                     )
                     if submit_orders and result.accepted and result.order_id is not None:
@@ -1157,9 +1671,7 @@ def run_loop() -> None:
                             price=price,
                             placed_ts=candle.start_ts,
                             exit_reason=reason,
-                            pnl=_pnl_for_side(
-                                position.side, position.entry_price, price, position.qty
-                            ),
+                            pnl=order_pnl,
                         )
                         _log_event(
                             "exit_submitted",
@@ -1167,6 +1679,7 @@ def run_loop() -> None:
                             side=position.side,
                             qty=position.qty,
                             reason=reason,
+                            reason_original=decision.reason if mismatch else None,
                             exit_ts=candle.start_ts.isoformat(),
                             exit_price=price,
                             order_id=result.order_id,
@@ -1178,11 +1691,10 @@ def run_loop() -> None:
                             market_ticker=position.market_ticker,
                             side=position.side,
                             reason=reason,
+                            reason_original=decision.reason if mismatch else None,
                             exit_ts=candle.start_ts.isoformat(),
                             exit_price=price,
-                            pnl=_pnl_for_side(
-                                position.side, position.entry_price, price, position.qty
-                            ),
+                            pnl=order_pnl,
                             entry_ts=position.entry_ts.isoformat(),
                             entry_price=position.entry_price,
                         )
@@ -1194,7 +1706,9 @@ def run_loop() -> None:
                         )
                     if not kill_switch:
                         mean_pnl, sample_count = store.recent_mean_pnl(
-                            KILL_SWITCH_SAMPLE, artifacts.quality_cutoff
+                            KILL_SWITCH_SAMPLE,
+                            artifacts.quality_cutoff,
+                            since_hours=kill_switch_window_h,
                         )
                         if (
                             sample_count == KILL_SWITCH_SAMPLE
@@ -1249,11 +1763,13 @@ def run_loop() -> None:
                     if candle.market_ticker in pending_entries:
                         reasons.append("pending_entry")
                     if reasons:
+                        failed_reason = ",".join(_normalize_failed_reasons(reasons))
                         _record_skip(candle.market_ticker, reasons)
                         _log_event(
                             "skip_entry",
                             market_ticker=candle.market_ticker,
                             reasons=",".join(reasons),
+                            failed_reason=failed_reason,
                             entry_ts=candle.start_ts.isoformat(),
                             entry_price=candle.close,
                             p_base=panic.p_base,
@@ -1320,11 +1836,13 @@ def run_loop() -> None:
                                 panic, candle, active_last_3
                             )
                         if eval_reasons:
+                            failed_reason = ",".join(_normalize_failed_reasons(eval_reasons))
                             _record_skip(candle.market_ticker, eval_reasons)
                             _log_event(
                                 "skip_entry",
                                 market_ticker=candle.market_ticker,
                                 reasons=",".join(eval_reasons),
+                                failed_reason=failed_reason,
                                 entry_ts=candle.start_ts.isoformat(),
                                 entry_price=entry_price,
                                 p_base=panic.p_base,
@@ -1418,6 +1936,7 @@ def run_loop() -> None:
                 last_panic_ts[candle.market_ticker] = panic.detected_ts
                 _log_event(
                     "panic_detected",
+                    panic_detected=True,
                     market_ticker=candle.market_ticker,
                     direction=panic.direction,
                     ts=panic.detected_ts.isoformat(),
@@ -1445,7 +1964,12 @@ def run_replay() -> dict[str, Any]:
     positions = store.load_open_positions()
     last_prices: dict[str, float] = {}
     kill_switch = False
-    mean_pnl, sample_count = store.recent_mean_pnl(KILL_SWITCH_SAMPLE, artifacts.quality_cutoff)
+    kill_switch_window_h = KALSHI_KILL_SWITCH_WINDOW_H if KALSHI_KILL_SWITCH_WINDOW_H > 0 else None
+    mean_pnl, sample_count = store.recent_mean_pnl(
+        KILL_SWITCH_SAMPLE,
+        artifacts.quality_cutoff,
+        since_hours=kill_switch_window_h,
+    )
     if sample_count == KILL_SWITCH_SAMPLE and mean_pnl is not None and mean_pnl < 0:
         kill_switch = True
 
@@ -1458,28 +1982,73 @@ def run_replay() -> dict[str, Any]:
 
         position = positions.get(candle.market_ticker)
         if position:
-            reason, exit_price, pnl = _exit_signal(
+            decision = _exit_decision(
                 position,
                 candle.start_ts,
                 candle.close,
                 last_prices.get(candle.market_ticker),
             )
-            if reason and exit_price is not None and pnl is not None:
+            if decision.reason and decision.exit_price is not None and decision.pnl is not None:
+                pnl_formula = _pnl_formula_for_side(position.side)
+                order_pnl = _pnl_for_side(
+                    position.side, position.entry_price, decision.exit_price, position.qty
+                )
+                reason, mismatch, expected = _guard_exit_reason(
+                    decision.reason,
+                    order_pnl,
+                    decision.take_profit,
+                    decision.stop_loss,
+                    EXIT_PNL_EPS,
+                )
+                _log_exit_decision(
+                    position=position,
+                    decision_reason=decision.reason,
+                    decision_price=decision.exit_price,
+                    decision_pnl=decision.pnl,
+                    decision_price_source=decision.price_source,
+                    fired_condition=decision.fired_condition,
+                    take_profit=decision.take_profit,
+                    stop_loss=decision.stop_loss,
+                    max_hold_s=decision.max_hold_seconds,
+                    pnl_formula=pnl_formula,
+                    exit_ts=candle.start_ts,
+                    order_price=decision.exit_price,
+                    order_pnl=order_pnl,
+                )
+                if mismatch:
+                    _log_event(
+                        "exit_reason_mismatch",
+                        market_ticker=position.market_ticker,
+                        side=position.side,
+                        direction=_direction_for_side(position.side),
+                        original_reason=decision.reason,
+                        expected_reason=expected,
+                        pnl=order_pnl,
+                        pnl_formula=pnl_formula,
+                        take_profit=decision.take_profit,
+                        stop_loss=decision.stop_loss,
+                        fired_condition=decision.fired_condition,
+                        exit_price_decision=decision.exit_price,
+                        exit_price_order=decision.exit_price,
+                        pnl_decision=decision.pnl,
+                    )
                 result = adapter.submit_exit(
                     ExitOrder(
                         order_key=_exit_order_key(position),
                         position=position,
                         exit_ts=candle.start_ts,
-                        exit_price=exit_price,
+                        exit_price=decision.exit_price,
                         exit_reason=reason,
-                        pnl=pnl,
+                        pnl=order_pnl,
                     )
                 )
                 if result.accepted:
                     positions.pop(candle.market_ticker, None)
                 if not kill_switch:
                     mean_pnl, sample_count = store.recent_mean_pnl(
-                        KILL_SWITCH_SAMPLE, artifacts.quality_cutoff
+                        KILL_SWITCH_SAMPLE,
+                        artifacts.quality_cutoff,
+                        since_hours=kill_switch_window_h,
                     )
                     if (
                         sample_count == KILL_SWITCH_SAMPLE

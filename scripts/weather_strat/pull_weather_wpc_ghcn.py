@@ -504,6 +504,7 @@ def build_dataset(
 
 def main() -> None:
     load_dotenv()
+    logging.basicConfig(level=os.getenv("WEATHER_LOG_LEVEL", "INFO"))
     repo_root = get_repo_root()
     parser = argparse.ArgumentParser(description="Build WPC/GHCN research dataset.")
     parser.add_argument("--kalshi_dataset", required=True, help="Path to Kalshi market dataset.")
@@ -514,6 +515,12 @@ def main() -> None:
         help="Environment variable name holding the NCEI token.",
     )
     args = parser.parse_args()
+    logger.info(
+        "Starting WPC/GHCN dataset build kalshi_dataset=%s candles_dir=%s output_dir=%s",
+        args.kalshi_dataset,
+        args.candles_dir,
+        repo_root / "research_outputs",
+    )
 
     build_dataset(
         Path(args.kalshi_dataset),

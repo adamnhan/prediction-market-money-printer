@@ -286,7 +286,15 @@ class PaperStore:
         )
         self.conn.commit()
 
-    def recent_mean_pnl(self, limit: int, quality_cutoff: float) -> tuple[float | None, int]:
+    def recent_mean_pnl(
+        self,
+        limit: int,
+        quality_cutoff: float,
+        since_hours: float | None = None,
+    ) -> tuple[float | None, int]:
+        cutoff = None
+        if since_hours is not None and since_hours > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
         rows = self.conn.execute(
             """
             SELECT pnl
@@ -295,10 +303,16 @@ class PaperStore:
               AND pnl IS NOT NULL
               AND quality_score IS NOT NULL
               AND quality_score >= ?
+              AND (? IS NULL OR exit_ts >= ?)
             ORDER BY exit_ts DESC
             LIMIT ?
             """,
-            (quality_cutoff, limit),
+            (
+                quality_cutoff,
+                cutoff.isoformat() if cutoff is not None else None,
+                cutoff.isoformat() if cutoff is not None else None,
+                limit,
+            ),
         ).fetchall()
         values = [_to_float(row[0]) for row in rows]
         filtered = [val for val in values if _is_valid_number(val)]
@@ -430,10 +444,20 @@ class MemoryPaperStore:
                 trade["pnl"] = pnl
                 break
 
-    def recent_mean_pnl(self, limit: int, quality_cutoff: float) -> tuple[float | None, int]:
+    def recent_mean_pnl(
+        self,
+        limit: int,
+        quality_cutoff: float,
+        since_hours: float | None = None,
+    ) -> tuple[float | None, int]:
+        cutoff = None
+        if since_hours is not None and since_hours > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
         filtered: list[float] = []
         for trade in reversed(self._trades):
             if trade["exit_ts"] is None:
+                continue
+            if cutoff is not None and trade["exit_ts"] < cutoff:
                 continue
             quality_score = trade.get("quality_score")
             if quality_score is None or quality_score < quality_cutoff:
@@ -539,9 +563,9 @@ class SignalEngine:
             vol_10_e = candle.vol_10 - self.artifacts.vol_quantiles["p90"]
             vol_sum_5_e = candle.vol_sum_5 - self.artifacts.volsum_quantiles["p90"]
             quality_score = (
-                _zscore(move_from_base, self.artifacts)
-                + _zscore(vol_10_e, self.artifacts)
-                + _zscore(vol_sum_5_e, self.artifacts)
+                _zscore(move_from_base, self.artifacts, "move_from_base")
+                + _zscore(vol_10_e, self.artifacts, "vol_10_e")
+                + _zscore(vol_sum_5_e, self.artifacts, "vol_sum_5_e")
             )
             if quality_score < self.artifacts.quality_cutoff:
                 reasons.append("quality_score")
@@ -755,7 +779,13 @@ def _is_mid_confidence(p_open: float) -> bool:
     return 0.15 <= abs(p_open - 0.5) < 0.30
 
 
-def _zscore(value: float, artifacts: Artifacts) -> float:
+def _zscore(value: float, artifacts: Artifacts, feature: str | None = None) -> float:
+    if feature and artifacts.zscore_features and feature in artifacts.zscore_features:
+        stats = artifacts.zscore_features[feature]
+        std = stats.get("std", 0.0)
+        if std == 0:
+            return 0.0
+        return (value - stats.get("mean", 0.0)) / std
     if artifacts.zscore_std == 0:
         return 0.0
     return (value - artifacts.zscore_mean) / artifacts.zscore_std
@@ -873,27 +903,77 @@ def _compute_pnl(side: str, entry_price: float, exit_price: float, qty: int) -> 
     return (entry_price - exit_price) * qty
 
 
+@dataclass(frozen=True)
+class ExitDecision:
+    reason: str | None
+    exit_price: float | None
+    pnl: float | None
+    fired_condition: str | None
+    price_source: str
+    take_profit: float
+    stop_loss: float
+    max_hold_seconds: float
+
+
+def _exit_decision(
+    position: Position,
+    candle_ts: datetime,
+    price: float,
+    last_price: float | None,
+) -> ExitDecision:
+    price_source = "entry_price_fallback"
+    if _is_valid_number(price):
+        exit_price = price
+        price_source = "candle_close"
+    elif last_price is not None:
+        exit_price = last_price
+        price_source = "last_price"
+    else:
+        exit_price = position.entry_price
+    pnl = _compute_pnl(position.side, position.entry_price, exit_price, position.qty)
+    fired_condition = None
+    reason = None
+    if _is_valid_number(price):
+        if pnl >= TAKE_PROFIT:
+            reason = "tp"
+            fired_condition = "tp"
+        elif pnl <= STOP_LOSS:
+            reason = "sl"
+            fired_condition = "sl"
+    if reason is None and candle_ts >= position.entry_ts + MAX_HOLD:
+        reason = "max_hold"
+        fired_condition = "max_hold"
+    if reason is None:
+        return ExitDecision(
+            None,
+            None,
+            None,
+            None,
+            price_source,
+            TAKE_PROFIT,
+            STOP_LOSS,
+            MAX_HOLD.total_seconds(),
+        )
+    return ExitDecision(
+        reason,
+        exit_price,
+        pnl,
+        fired_condition,
+        price_source,
+        TAKE_PROFIT,
+        STOP_LOSS,
+        MAX_HOLD.total_seconds(),
+    )
+
+
 def _exit_signal(
     position: Position,
     candle_ts: datetime,
     price: float,
     last_price: float | None,
 ) -> tuple[str | None, float | None, float | None]:
-    if _is_valid_number(price):
-        exit_price = price
-    elif last_price is not None:
-        exit_price = last_price
-    else:
-        exit_price = position.entry_price
-    pnl = _compute_pnl(position.side, position.entry_price, exit_price, position.qty)
-    if _is_valid_number(price):
-        if pnl >= TAKE_PROFIT:
-            return "tp", exit_price, pnl
-        if pnl <= STOP_LOSS:
-            return "sl", exit_price, pnl
-    if candle_ts >= position.entry_ts + MAX_HOLD:
-        return "max_hold", exit_price, pnl
-    return None, None, None
+    decision = _exit_decision(position, candle_ts, price, last_price)
+    return decision.reason, decision.exit_price, decision.pnl
 
 
 def _log_event(state: EngineState | None, event: str, **fields: Any) -> None:

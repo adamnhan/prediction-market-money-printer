@@ -123,6 +123,12 @@ def build_registry_records(matches: list[MatchGroupResult]) -> list[Any]:
         asset_ids, outcomes, outcome_map = _polymarket_assets(match.polymarket.representative)
         team_markets, team_norms = _kalshi_team_markets(match.kalshi.members)
         match_details = dict(match.details)
+        kalshi_start = match.kalshi.representative.start_time_utc
+        polymarket_start = match.polymarket.representative.start_time_utc
+        if kalshi_start:
+            match_details["kalshi_start_time_utc"] = kalshi_start.isoformat()
+        if polymarket_start:
+            match_details["polymarket_start_time_utc"] = polymarket_start.isoformat()
         if asset_ids:
             match_details["polymarket_asset_ids"] = asset_ids
         if outcomes:

@@ -1,10 +1,12 @@
 # kalshi_fetcher/kalshi_client.py
 
 import requests
-from config import KALSHI_API_BASE_URL
+from kalshi_fetcher.config import KALSHI_API_BASE_URL
+
+DEFAULT_TIMEOUT_S = 15
 
 
-def request(endpoint: str, params: dict | None = None) -> dict:
+def request(endpoint: str, params: dict | None = None, timeout_s: int | float = DEFAULT_TIMEOUT_S) -> dict:
     """
     Make a GET request to the Kalshi API (public endpoints, no auth).
     
@@ -17,7 +19,7 @@ def request(endpoint: str, params: dict | None = None) -> dict:
     """
     url = f"{KALSHI_API_BASE_URL}{endpoint}"
 
-    response = requests.get(url, params=params)
+    response = requests.get(url, params=params, timeout=timeout_s)
     response.raise_for_status()  # throw if HTTP error
 
     return response.json()

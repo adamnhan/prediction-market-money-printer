@@ -12,6 +12,7 @@ class Artifacts:
     zscore_mean: float
     zscore_std: float
     quality_cutoff: float
+    zscore_features: dict[str, dict[str, float]] | None = None
 
     def summary(self) -> str:
         return (
@@ -20,7 +21,8 @@ class Artifacts:
             f"volsum_quantiles={self.volsum_quantiles} "
             f"zscore_mean={self.zscore_mean} "
             f"zscore_std={self.zscore_std} "
-            f"quality_cutoff={self.quality_cutoff}"
+            f"quality_cutoff={self.quality_cutoff} "
+            f"zscore_features={list(self.zscore_features or {})}"
         )
 
 
@@ -64,10 +66,28 @@ def load_artifacts(path: Path | None = None) -> Artifacts:
     if not isinstance(quality_cutoff, (int, float)):
         raise ValueError("quality_cutoff must be a number")
 
+    zscore_features_raw = raw.get("zscore_features")
+    zscore_features: dict[str, dict[str, float]] | None = None
+    if zscore_features_raw is not None:
+        if not isinstance(zscore_features_raw, dict):
+            raise ValueError("zscore_features must be a dict")
+        zscore_features = {}
+        for key, stats in zscore_features_raw.items():
+            if not isinstance(key, str):
+                raise ValueError("zscore_features keys must be strings")
+            if not isinstance(stats, dict):
+                raise ValueError(f"zscore_features[{key}] must be a dict")
+            mean = stats.get("mean")
+            std = stats.get("std")
+            if not isinstance(mean, (int, float)) or not isinstance(std, (int, float)):
+                raise ValueError(f"zscore_features[{key}] must have mean/std numbers")
+            zscore_features[key] = {"mean": float(mean), "std": float(std)}
+
     return Artifacts(
         vol_quantiles=vol_quantiles,
         volsum_quantiles=volsum_quantiles,
         zscore_mean=float(zscore_mean),
         zscore_std=float(zscore_std),
         quality_cutoff=float(quality_cutoff),
+        zscore_features=zscore_features,
     )

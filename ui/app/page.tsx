@@ -330,15 +330,23 @@ export default function HomePage() {
             </div>
           </div>
 
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={loadState}
-            className="gap-2 border-slate-700 bg-slate-900 text-slate-100 hover:border-slate-500 hover:bg-slate-800"
-          >
-            <RefreshCcw className="h-4 w-4" />
-            Refresh now
-          </Button>
+          <div className="flex items-center gap-3">
+            <a
+              href="/phase2"
+              className="inline-flex items-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:border-emerald-300/60 hover:bg-emerald-400/20"
+            >
+              Phase 2 Dashboard
+            </a>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={loadState}
+              className="gap-2 border-slate-700 bg-slate-900 text-slate-100 hover:border-slate-500 hover:bg-slate-800"
+            >
+              <RefreshCcw className="h-4 w-4" />
+              Refresh now
+            </Button>
+          </div>
         </header>
 
 

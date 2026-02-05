@@ -353,9 +353,9 @@ class SignalEngine:
             vol_10_e = candle.vol_10 - self.artifacts.vol_quantiles["p90"]
             vol_sum_5_e = candle.vol_sum_5 - self.artifacts.volsum_quantiles["p90"]
             quality_score = (
-                _zscore(move_from_base, self.artifacts)
-                + _zscore(vol_10_e, self.artifacts)
-                + _zscore(vol_sum_5_e, self.artifacts)
+                _zscore(move_from_base, self.artifacts, "move_from_base")
+                + _zscore(vol_10_e, self.artifacts, "vol_10_e")
+                + _zscore(vol_sum_5_e, self.artifacts, "vol_sum_5_e")
             )
             if quality_score < self.artifacts.quality_cutoff:
                 reasons.append("quality_score")
@@ -371,7 +371,13 @@ def _is_mid_confidence(p_open: float) -> bool:
     return 0.15 <= abs(p_open - 0.5) < 0.30
 
 
-def _zscore(value: float, artifacts: Artifacts) -> float:
+def _zscore(value: float, artifacts: Artifacts, feature: str | None = None) -> float:
+    if feature and artifacts.zscore_features and feature in artifacts.zscore_features:
+        stats = artifacts.zscore_features[feature]
+        std = stats.get("std", 0.0)
+        if std == 0:
+            return 0.0
+        return (value - stats.get("mean", 0.0)) / std
     if artifacts.zscore_std == 0:
         return 0.0
     return (value - artifacts.zscore_mean) / artifacts.zscore_std

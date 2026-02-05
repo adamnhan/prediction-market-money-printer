@@ -267,6 +267,7 @@ class L2Recorder:
         except Exception:
             pass
 
+
 class MarketState:
     def __init__(self, ticker: str) -> None:
         self.ticker = ticker

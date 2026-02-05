@@ -23,16 +23,16 @@ if not logger.handlers:
 
 @dataclass(frozen=True)
 class MakerTakerConfig:
-    edge_target: float = 0.015
-    buffer_per_contract: float = 0.005
+    edge_target: float = 0.005
+    buffer_per_contract: float = 0.003
     kalshi_fee_per_contract: float = 0.001
     polymarket_fee_per_contract: float = 0.0
     tick_size: float = 0.01
     quote_size: float = 1.0
-    ttl_seconds: float = 30.0
+    ttl_seconds: float = 15.0
     min_reprice_interval_s: float = 1.0
-    reprice_threshold_ticks: int = 1
-    allow_reprice_up: bool = False
+    reprice_threshold_ticks: int = 2
+    allow_reprice_up: bool = True
     fresh_s: float = 1.0
     sync_s: float = 0.25
     use_dirty_sync: bool = True
@@ -105,6 +105,15 @@ class MakerTakerCoordinator:
             if intent is None or intent.reason:
                 state.last_intent = intent
                 return trades
+            logger.info(
+                "intent game=%s team=%s kalshi_ticker=%s poly_asset_id=%s poly_ask=%.4f edge_per_contract=%.4f",
+                intent.game_key,
+                intent.team_to_buy,
+                intent.kalshi_ticker,
+                intent.poly_asset_id,
+                intent.poly_ask,
+                intent.edge_per_contract,
+            )
             state.active_order = _place_order(intent, now, self._config)
             self._note_order_placed(now)
             state.status = "QUOTE_PLACED"
@@ -113,6 +122,27 @@ class MakerTakerCoordinator:
             return trades
 
         order = state.active_order
+        book = manager.get_book("kalshi", order.ticker)
+        best_bid = book.best_bid[0] if book and book.best_bid else None
+        best_ask = book.best_ask[0] if book and book.best_ask else None
+        distance_ticks = None
+        if best_bid is not None and self._config.tick_size > 0:
+            distance_ticks = (best_bid - order.price) / self._config.tick_size
+        fee_total = self._config.kalshi_fee_per_contract + self._config.polymarket_fee_per_contract
+        bid_max = 1.0 - order.poly_ask_at_quote - fee_total - self._config.buffer_per_contract - self._config.edge_target
+        logger.info(
+            "active_order game=%s team=%s my_price=%.4f best_bid=%s best_ask=%s distance_ticks=%s age_s=%.2f poly_ask=%.4f bid_max=%.4f edge_per_contract=%.4f",
+            order.game_key,
+            order.team_norm,
+            order.price,
+            f"{best_bid:.4f}" if best_bid is not None else "n/a",
+            f"{best_ask:.4f}" if best_ask is not None else "n/a",
+            f"{distance_ticks:.2f}" if distance_ticks is not None else "n/a",
+            now - order.created_ts,
+            order.poly_ask_at_quote,
+            bid_max,
+            order.edge_per_contract,
+        )
         if now - order.created_ts >= order.ttl_seconds:
             order.status = "EXPIRED"
             state.active_order = None
